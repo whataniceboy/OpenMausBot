@@ -183,6 +183,11 @@ export function vpsDockerArgs(alias: string, args: string[]): string[] {
   if (!isValidSshAlias(alias)) {
     throw new Error("invalid VPS SSH config alias");
   }
+  // Same-host deployments (Docker socket mounted into the container) skip SSH:
+  // Docker CLI's security check rejects the ssh shim prepareVpsSsh installs.
+  if (process.env.DOCKER_HOST && process.env.DOCKER_HOST.startsWith("unix://")) {
+    return ["-H", process.env.DOCKER_HOST, ...args];
+  }
   return ["-H", `ssh://${alias}`, ...args];
 }
 
