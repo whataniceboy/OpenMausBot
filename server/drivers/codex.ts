@@ -110,22 +110,41 @@ export function chatgptPlanCodexArgs(): string[] {
  * In regions where api.openai.com is blocked (or when a custom gateway is
  * configured), every background call fails with 403.
  *
- * When OMB_CODEX_GATEWAY_URL is set, background calls route through that
- * URL instead, using OMB_CODEX_GATEWAY_TOKEN (or GATEWAY_TOKEN) for auth.
+ * When OMB_CODEX_GATEWAY_URL (or GATEWAY_URL) is set, background calls route
+ * through that URL instead. The URL must be HTTPS, or plain HTTP on loopback,
+ * so tokens never travel in cleartext to a remote host. The selected token
+ * (OMB_CODEX_GATEWAY_TOKEN or GATEWAY_TOKEN) is placed in the child
+ * environment as GATEWAY_TOKEN so Codex always reads the right one.
  */
-export function gatewayCodexArgs(): string[] {
-  const url = process.env.OMB_CODEX_GATEWAY_URL || process.env.GATEWAY_URL;
-  if (!url) return [];
-  const base = url.replace(/\/+$/, "") + (url.endsWith("/v1") ? "/" : "/v1/");
-  const key = process.env.OMB_CODEX_GATEWAY_TOKEN || process.env.GATEWAY_TOKEN || "";
-  return [
-    "-c", 'model_provider="omb_gateway"',
-    "-c", 'model_providers.omb_gateway.name="Gateway"',
-    "-c", `model_providers.omb_gateway.base_url=${JSON.stringify(base)}`,
-    "-c", 'model_providers.omb_gateway.env_key="GATEWAY_TOKEN"',
-    "-c", 'model_providers.omb_gateway.wire_api="responses"',
-    "-c", "model_providers.omb_gateway.requires_openai_auth=false",
-  ];
+export function gatewayCodexArgs(): { args: string[]; token: string | null } {
+  const rawUrl = process.env.OMB_CODEX_GATEWAY_URL || process.env.GATEWAY_URL;
+  if (!rawUrl) return { args: [], token: null };
+  const parsed = new URL(rawUrl);
+  const isLoopback = parsed.hostname === "localhost" || parsed.hostname === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(parsed.hostname);
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback)) {
+    console.warn(`codex: gateway URL must be HTTPS (or loopback HTTP), got ${parsed.protocol}//${parsed.hostname}; ignoring`);
+    return { args: [], token: null };
+  }
+  // Append /v1/ only when the URL does not already end with a version path.
+  const trimmed = parsed.href.replace(/\/+$/, "");
+  const base = /\/v\d+$/.test(trimmed) ? `${trimmed}/` : `${trimmed}/v1/`;
+  const token = process.env.OMB_CODEX_GATEWAY_TOKEN || process.env.GATEWAY_TOKEN || "";
+  return {
+    args: [
+      "-c", 'model_provider="omb_gateway"',
+      "-c", 'model_providers.omb_gateway.name="Gateway"',
+      "-c", `model_providers.omb_gateway.base_url=${JSON.stringify(base)}`,
+      "-c", 'model_providers.omb_gateway.env_key="GATEWAY_TOKEN"',
+      "-c", 'model_providers.omb_gateway.wire_api="responses"',
+      "-c", "model_providers.omb_gateway.requires_openai_auth=false",
+    ],
+    token: token || null,
+  };
+}
+
+/** The token gatewayCodexArgs selected; injected into child env so Codex reads the right variable. */
+function gatewayChildEnv(gateway: { args: string[]; token: string | null }): Record<string, string> {
+  return gateway.token ? { GATEWAY_TOKEN: gateway.token } : {};
 }
 
 function decodeManagedCodex(raw: object): NonNullable<CodexConfig["managed"]> {
@@ -694,7 +713,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const env = childEnv();
         const launchedLogin = chatgptTurn ? storedCodexLogin(env) : null;
         if (planToken) env.OPENMAUSBOT_CHATGPT_TOKEN = planToken;
-        const appServerArgs = ["app-server", ...(plan ? chatgptPlanCodexArgs() : config.managed ? managedCodexArgs(config.managed) : codexLocalProviderArgs(env, turn.model)), ...gatewayCodexArgs(), ...codexToolSurfaceArgs(),
+        const gateway = gatewayCodexArgs();
+        Object.assign(env, gatewayChildEnv(gateway));
+        const appServerArgs = ["app-server", ...(plan ? chatgptPlanCodexArgs() : config.managed ? managedCodexArgs(config.managed) : codexLocalProviderArgs(env, turn.model)), ...gateway.args, ...codexToolSurfaceArgs(),
           // Native shell snapshots can restore variables the shell policy removed.
           ...(turn.toolScope === undefined ? [] : ["-c", "features.shell_snapshot=false"]),
           // A guest-driven turn: no shell, no file reads (-c wins over config files).
@@ -1723,13 +1744,19 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     }
     const route = codexBackgroundRoute(models, smallModelsUsable(), options.fallback);
     if (!route) throw new Error("Codex lists no model for background calls. Refresh models in Settings → Model providers → Codex.");
+    const oneShotGateway = gatewayCodexArgs();
+    Object.assign(env, gatewayChildEnv(oneShotGateway));
     return runCodexBackgroundRoute(route, (id) => {
       const selection = planAuth || config.managed ? { model: id, modelProvider: null } : decodeCodexSelection(id);
+      // When the gateway is active, route every background turn through it so
+      // the app-server default provider ("openai") cannot bypass the override.
+      const isInjectedLocal = selection.modelProvider !== null && selection.modelProvider !== OFFICIAL_CODEX_PROVIDER;
+      const effectiveProvider = oneShotGateway.args.length > 0 && !isInjectedLocal ? "omb_gateway" : selection.modelProvider;
       return runCodexOneShot({
         spawn: spawnCli, kill: killCliTree, cli: config.cli, env, prompt, options,
         model: selection.model ?? id,
-        modelProvider: selection.modelProvider,
-        providerArgs: planAuth || config.managed ? providerArgs : [...codexLocalProviderArgs(env, id), ...gatewayCodexArgs()],
+        modelProvider: effectiveProvider,
+        providerArgs: planAuth || config.managed ? providerArgs : [...codexLocalProviderArgs(env, id), ...(oneShotGateway.args.length > 0 && !isInjectedLocal ? oneShotGateway.args : [])],
         describeError: (message) => codexUserError(message, planAuth ? "plan" : selection.modelProvider === OFFICIAL_CODEX_PROVIDER ? "own" : "other"),
       });
     }, options);
