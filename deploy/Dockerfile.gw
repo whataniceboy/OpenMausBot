@@ -1,0 +1,15 @@
+FROM ghcr.io/milind-soni/openmausbot:latest
+
+# --- Runtime dependencies (same-host deployment) ---
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 docker.io openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Bundle patches (survive container rebuild) ---
+# Patch 1: Docker local socket support (OMB_VPS_DOCKER_HOST)
+# Patch 2: SSH ControlMaster=no (prevents viewer tunnel from forking on Linux)
+COPY patches/apply-patches.sh /tmp/apply-patches.sh
+RUN chmod +x /tmp/apply-patches.sh && /tmp/apply-patches.sh && rm /tmp/apply-patches.sh
+
+USER maus
