@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR, type AppConfig } from "./config.ts";
 import { loadEnvironmentId } from "./environment.ts";
@@ -12,6 +12,18 @@ import {
   type ManagedVpsOwner,
   type VpsCommandRunner,
 } from "./vps-computer.ts";
+
+// These tests model the SSH transport; an OMB_VPS_DOCKER_HOST inherited from the outer
+// environment would reroute them to a socket and fail before exercising the fixtures.
+let savedDockerHost: string | undefined;
+beforeEach(() => {
+  savedDockerHost = process.env.OMB_VPS_DOCKER_HOST;
+  delete process.env.OMB_VPS_DOCKER_HOST;
+});
+afterEach(() => {
+  if (savedDockerHost !== undefined) process.env.OMB_VPS_DOCKER_HOST = savedDockerHost;
+  else delete process.env.OMB_VPS_DOCKER_HOST;
+});
 
 const CONFIG: AppConfig = { vps: { sshAlias: "production-vps" } };
 const OWNER: ManagedVpsOwner = { botId: "bot-current", name: "Research", inUse: false };

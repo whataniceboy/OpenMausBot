@@ -7,10 +7,14 @@ import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { createServer, type Server } from "node:net";
 
-const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
+const { spawnMock, masterMock } = vi.hoisted(() => ({ spawnMock: vi.fn(), masterMock: vi.fn() }));
 vi.mock("node:child_process", async () => ({
   ...(await vi.importActual<typeof import("node:child_process")>("node:child_process")),
   spawn: spawnMock,
+}));
+vi.mock("./vps-ssh.ts", async () => ({
+  ...(await vi.importActual<typeof import("./vps-ssh.ts")>("./vps-ssh.ts")),
+  ensureVpsSshMaster: masterMock,
 }));
 
 import {
@@ -170,8 +174,8 @@ function fixture({
     }
     if (command === "inspect") {
       if (!state.container) throw new Error(`Error: No such object: ${name}`);
-      // The join reuse path asks for the bare id to revalidate the tunnel's container.
-      if (args.includes("--format") && args.includes("{{.Id}}")) return { stdout: `${containerId}\n`, stderr: "" };
+      // The join reuse path asks for the id and running state to revalidate the tunnel's container.
+      if (args.includes("--format") && args.some((arg) => arg.includes("{{.Id}}"))) return { stdout: `${containerId} running true\n`, stderr: "" };
       return {
         stdout: JSON.stringify([{
           Config: {
@@ -326,6 +330,19 @@ describe("VPS computer", () => {
     } finally {
       if (saved !== undefined) process.env.OMB_VPS_DOCKER_HOST = saved;
       else delete process.env.OMB_VPS_DOCKER_HOST;
+    }
+  });
+
+  it("provisions over the socket without any SSH alias configured", async () => {
+    const fake = fixture({ image: false, container: false });
+    process.env.OMB_VPS_DOCKER_HOST = "unix:///var/run/docker.sock";
+    try {
+      const status = await vpsComputerAction("provision", { vps: {} }, BOT_ID, fake.runner);
+      expect(status.ready).toBe(true);
+      expect(fake.calls.length).toBeGreaterThan(0);
+      expect(fake.calls.every(({ args }) => args[0] === "-H" && args[1] === "unix:///var/run/docker.sock")).toBe(true);
+    } finally {
+      delete process.env.OMB_VPS_DOCKER_HOST;
     }
   });
 
@@ -1335,7 +1352,7 @@ describe("remote desktop tunnel ownership", () => {
       const hiccup = fixture();
       const originalRunner = hiccup.runner;
       const flaky: VpsCommandRunner = async (args, options) => {
-        if (args[2] === "inspect" && args.includes("--format")) throw new Error("ssh: connect timed out");
+        if (args[2] === "inspect" && args.some((arg) => arg.includes("{{.Id}}"))) throw new Error("ssh: connect timed out");
         return originalRunner(args, options);
       };
       const second = await vpsComputerJoin(CONFIG, BOT_ID, flaky, true);
@@ -1344,12 +1361,23 @@ describe("remote desktop tunnel ownership", () => {
       // A confirmed missing container rebuilds instead of reusing the dead forward.
       const gone = fixture();
       const missing: VpsCommandRunner = async (args, options) => {
-        if (args[2] === "inspect" && args.includes("--format")) throw new Error("Error: No such object: " + args[3]);
+        if (args[2] === "inspect" && args.some((arg) => arg.includes("{{.Id}}"))) throw new Error("Error: No such object: " + args[3]);
         return gone.runner(args, options);
       };
       await vpsComputerJoin(CONFIG, BOT_ID, missing, true);
       expect(children).toHaveLength(2);
       expect(children[0]!.kill).toHaveBeenCalledTimes(1);
+      // An external stop keeps the id but kills the desktop: refuse instead of reporting running.
+      const stoppedStatus = fixture({ running: false });
+      const halted: VpsCommandRunner = async (args, options) => {
+        if (args[2] === "inspect" && args.some((arg) => arg.includes("{{.Id}}"))) {
+          return { stdout: `${CONTAINER_ID} exited false\n`, stderr: "" };
+        }
+        return stoppedStatus.runner(args, options);
+      };
+      await expect(vpsComputerJoin(CONFIG, BOT_ID, halted, true)).rejects.toMatchObject({ status: 409 });
+      expect(children).toHaveLength(2); // no third tunnel: the join refused rather than rebuilt
+      expect(children[1]!.kill).toHaveBeenCalledTimes(1); // the stale tunnel was still torn down
     } finally { closeAllVpsDesktopTunnels(); }
   });
 
@@ -1411,7 +1439,9 @@ describe("the managed-container inventory scan", () => {
     const runner: VpsCommandRunner = async (args) => {
       calls.push(args);
       if (args[2] === "container" && args.includes("ls")) return { stdout: `${FULL_ID.slice(0, 12)}\n`, stderr: "" };
-      if (args[2] === "container" && args.includes("inspect") && args.includes("--format")) {
+      if (args[2] === "container" && args.includes("inspect")) {
+        // Pin the template itself: a wrong field path or a full-object format must fail loudly.
+        expect(args[args.length - 1]).toBe('{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json .Config.Labels}},"Status":{{json .State.Status}},"Running":{{json .State.Running}}}');
         const line = { Id: FULL_ID, Name: `/${vpsContainerName(BOT_ID)}`, Labels: { [VPS_MANAGED_LABEL]: "1", [VPS_CONTAINER_LABEL]: vpsContainerName(BOT_ID) }, Status: "running", Running: true };
         return { stdout: `${JSON.stringify(line)}\n`, stderr: "" };
       }

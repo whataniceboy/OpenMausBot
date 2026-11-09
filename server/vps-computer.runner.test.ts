@@ -3,7 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { spawnMock, stopMock } = vi.hoisted(() => ({ spawnMock: vi.fn(), stopMock: vi.fn() }));
+const { spawnMock, stopMock, masterMock } = vi.hoisted(() => ({ spawnMock: vi.fn(), stopMock: vi.fn(), masterMock: vi.fn() }));
 
 vi.mock("node:child_process", async () => ({
   ...(await vi.importActual<typeof import("node:child_process")>("node:child_process")),
@@ -12,6 +12,10 @@ vi.mock("node:child_process", async () => ({
 vi.mock("./procs.ts", async () => ({
   ...(await vi.importActual<typeof import("./procs.ts")>("./procs.ts")),
   killCliTree: stopMock,
+}));
+vi.mock("./vps-ssh.ts", async () => ({
+  ...(await vi.importActual<typeof import("./vps-ssh.ts")>("./vps-ssh.ts")),
+  ensureVpsSshMaster: masterMock,
 }));
 
 import { defaultRunner, dockerCliInstallCommand } from "./vps-computer.ts";
