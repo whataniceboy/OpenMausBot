@@ -69,6 +69,7 @@ let savedDockerHost: string | undefined;
 beforeEach(() => {
   savedDockerHost = process.env.OMB_VPS_DOCKER_HOST;
   delete process.env.OMB_VPS_DOCKER_HOST;
+  masterMock.mockReset().mockResolvedValue(undefined);
 });
 afterEach(() => {
   if (savedDockerHost !== undefined) process.env.OMB_VPS_DOCKER_HOST = savedDockerHost;
@@ -679,6 +680,15 @@ describe("VPS computer", () => {
     expect(connection.command).toBe(process.execPath);
     expect(connection.args.slice(-2)).toEqual(["production-vps", vpsContainerName(BOT_ID)]);
     expect(connection.env).toEqual({ ELECTRON_RUN_AS_NODE: "1" });
+    // Socket mode must reach the bridge process too, or it would SSH to the placeholder alias.
+    process.env.OMB_VPS_DOCKER_HOST = "unix:///var/run/docker.sock";
+    try {
+      const socketOnly = vpsComputerMcp({ vps: {} }, BOT_ID);
+      expect(socketOnly.args.slice(-2)[0]).toBe("docker-socket");
+      expect(socketOnly.env).toEqual({ ELECTRON_RUN_AS_NODE: "1", OMB_VPS_DOCKER_HOST: "unix:///var/run/docker.sock" });
+    } finally {
+      delete process.env.OMB_VPS_DOCKER_HOST;
+    }
     expect(vpsComputerMcp(CONFIG, BOT_ID, CONTAINER_ID).args.slice(-2)).toEqual(["production-vps", CONTAINER_ID]);
     expect(vpsContainerMcpArgs("production-vps", vpsContainerName(BOT_ID))).toEqual([
       "-H",
@@ -1370,7 +1380,7 @@ describe("remote desktop tunnel ownership", () => {
       // An external stop keeps the id but kills the desktop: refuse instead of reporting running.
       const stoppedStatus = fixture({ running: false });
       const halted: VpsCommandRunner = async (args, options) => {
-        if (args[2] === "inspect" && args.some((arg) => arg.includes("{{.Id}}"))) {
+        if (args[2] === "inspect" && args.includes("--format") && args.some((arg) => arg.includes("{{.Id}}"))) {
           return { stdout: `${CONTAINER_ID} exited false\n`, stderr: "" };
         }
         return stoppedStatus.runner(args, options);
@@ -1378,6 +1388,16 @@ describe("remote desktop tunnel ownership", () => {
       await expect(vpsComputerJoin(CONFIG, BOT_ID, halted, true)).rejects.toMatchObject({ status: 409 });
       expect(children).toHaveLength(2); // no third tunnel: the join refused rather than rebuilt
       expect(children[1]!.kill).toHaveBeenCalledTimes(1); // the stale tunnel was still torn down
+      // A paused container still reports Running=true; its desktop cannot answer, so refuse too.
+      const pausedStatus = fixture({ running: false });
+      const paused: VpsCommandRunner = async (args, options) => {
+        if (args[2] === "inspect" && args.includes("--format") && args.some((arg) => arg.includes("{{.Id}}"))) {
+          return { stdout: `${CONTAINER_ID} paused true\n`, stderr: "" };
+        }
+        return pausedStatus.runner(args, options);
+      };
+      await expect(vpsComputerJoin(CONFIG, BOT_ID, paused, true)).rejects.toMatchObject({ status: 409 });
+      expect(children).toHaveLength(2);
     } finally { closeAllVpsDesktopTunnels(); }
   });
 

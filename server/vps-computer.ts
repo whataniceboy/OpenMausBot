@@ -378,9 +378,11 @@ export async function defaultRunner(args: string[], options: VpsCommandOptions =
   const ssh = socket ? { path: augmentedPath(), configPath: null } : prepareVpsSsh(DATA_DIR, augmentedPath());
   const deadline = Date.now() + (options.timeoutMs ?? 120_000);
   // Like upstream's runner: bring up (or reuse) the shared master before Docker spawns, or a
-  // cold burst would make every command authenticate its own SSH connection.
+  // cold burst would make every command authenticate its own SSH connection. A rejected warmup
+  // must not stop Docker itself: a restricted key can permit `docker system dial-stdio` while
+  // rejecting the warmup probe, and the command may still succeed on its own connection.
   const destination = args[0] === "-H" && args[1]?.startsWith("ssh://") ? args[1]!.slice(6) : null;
-  if (destination) await ensureVpsSshMaster(ssh, destination, Math.min(30_000, deadline - Date.now()));
+  if (destination) await Promise.resolve(ensureVpsSshMaster(ssh, destination, Math.min(30_000, deadline - Date.now()))).catch(() => undefined);
   if (Date.now() >= deadline) throw new Error(`${dockerTransportLabel()} command timed out`);
   return new Promise((resolve, reject) => {
     const child = spawnCli("docker", args, {
@@ -417,7 +419,7 @@ export async function defaultRunner(args: string[], options: VpsCommandOptions =
         setTimeout(cleaned, UNCONFIRMED_STOP_HOLD_MS).unref?.();
       }, cleaned);
     };
-    timeout = setTimeout(() => fail(new Error(`${dockerTransportLabel()} command timed out`)), options.timeoutMs ?? 120_000);
+    timeout = setTimeout(() => fail(new Error(`${dockerTransportLabel()} command timed out`)), Math.max(1, deadline - Date.now()));
     timeout.unref?.();
 
     child.stdout.setEncoding("utf8");
@@ -1320,9 +1322,10 @@ async function tunnelUnfitForReuse(
       vpsDockerArgs(alias, ["inspect", tunnel.containerName, "--format", "{{.Id}} {{.State.Status}} {{.State.Running}}"]),
       { timeoutMs: 10_000 },
     );
-    const [id, , running] = inspected.stdout.trim().toLowerCase().split(/\s+/);
-    // An external stop keeps the id but kills the desktop the tunnel forwards to.
-    return !id?.startsWith(tunnel.containerId.toLowerCase()) || running !== "true";
+    const [id, status, running] = inspected.stdout.trim().toLowerCase().split(/\s+/);
+    // An external stop keeps the id but kills the desktop the tunnel forwards to; a paused
+    // container still reports Running=true while its desktop cannot answer.
+    return !id?.startsWith(tunnel.containerId.toLowerCase()) || status !== "running" || running !== "true";
   } catch (error) {
     return isMissingObjectMessage(error instanceof Error ? error.message : String(error));
   }
@@ -1461,10 +1464,13 @@ export function vpsComputerMcp(cfg: AppConfig, botId: string, containerRef?: str
 } {
   const alias = vpsTransportAlias(cfg);
   if (!alias) throw new Error("VPS is not configured — add an SSH config alias first");
+  const socket = localDockerSocket();
   return {
     command: process.execPath,
     args: [SPAWNED_PROXIES.vpsContainerMcp, alias, containerRef ?? vpsContainerName(botId)],
-    env: { ELECTRON_RUN_AS_NODE: "1" },
+    // The bridge process relies on this env to pick its transport: without it, a socket-only
+    // deployment would try SSH to the placeholder alias and fail before any tool starts.
+    env: { ELECTRON_RUN_AS_NODE: "1", ...(socket ? { OMB_VPS_DOCKER_HOST: socket } : {}) },
   };
 }
 

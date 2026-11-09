@@ -43,6 +43,7 @@ describe("default VPS command runner", () => {
   beforeEach(() => {
     spawnMock.mockReset();
     stopMock.mockReset().mockResolvedValue(true);
+    masterMock.mockReset().mockResolvedValue(undefined);
     // These tests assert SSH-transport behavior; an inherited socket setting would reroute them.
     savedDockerHost = process.env.OMB_VPS_DOCKER_HOST;
     delete process.env.OMB_VPS_DOCKER_HOST;
@@ -128,6 +129,35 @@ describe("default VPS command runner", () => {
     const message = await result.catch((error: Error) => error.message);
     expect(message).toContain("Docker over SSH could not start: spawn docker ENOENT");
     expect(message).toContain(dockerCliInstallCommand(process.platform)!);
+  });
+
+  it("still runs Docker when the SSH warmup is rejected (a restricted key may allow only dial-stdio)", async () => {
+    const child = fakeChild();
+    spawnMock.mockImplementation(() => child);
+    masterMock.mockRejectedValue(new Error("command not allowed"));
+    const result = defaultRunner(["-H", "ssh://production-vps", "info"]);
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled()); // let the warmup settle and spawn first
+    child.stdout.end("ok");
+    child.emit("close", 0, null);
+    await expect(result).resolves.toEqual({ stdout: "ok", stderr: "" });
+  });
+
+  it("subtracts SSH warmup time from the Docker command budget", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild();
+    spawnMock.mockImplementation(() => child);
+    stopMock.mockResolvedValue(true);
+    masterMock.mockImplementation(async () => { await new Promise((resolve) => setTimeout(resolve, 40)); });
+    let settled = false;
+    const result = defaultRunner(["-H", "ssh://production-vps", "info"], { timeoutMs: 100 });
+    void result.then(() => { settled = true; }, () => { settled = true; });
+    const rejection = expect(result).rejects.toThrow("Docker over SSH command timed out");
+
+    await vi.advanceTimersByTimeAsync(40); // warmup consumed 40ms of the budget
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(60); // exactly the remaining budget: the timer must fire
+    await rejection;
+    expect(settled).toBe(true);
   });
 
   it.skipIf(process.platform === "win32").each(["timeout", "stdin"])("reaps real SSH-like grandchildren after %s without stopping an unrelated master", async (failure) => {
