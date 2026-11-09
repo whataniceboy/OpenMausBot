@@ -382,7 +382,11 @@ export async function defaultRunner(args: string[], options: VpsCommandOptions =
   // must not stop Docker itself: a restricted key can permit `docker system dial-stdio` while
   // rejecting the warmup probe, and the command may still succeed on its own connection.
   const destination = args[0] === "-H" && args[1]?.startsWith("ssh://") ? args[1]!.slice(6) : null;
-  if (destination) await Promise.resolve(ensureVpsSshMaster(ssh, destination, Math.min(30_000, deadline - Date.now()))).catch(() => undefined);
+  // Reserve at least half the budget (and up to 30s) for Docker itself: a cold warmup that
+  // exhausts the whole command budget would fail before Docker ever gets to try, even when
+  // the daemon is reachable once the connection exists.
+  const warmupBudget = Math.min(30_000, Math.floor(Math.max(0, deadline - Date.now()) / 2));
+  if (destination && warmupBudget > 0) await Promise.resolve(ensureVpsSshMaster(ssh, destination, warmupBudget)).catch(() => undefined);
   if (Date.now() >= deadline) throw new Error(`${dockerTransportLabel()} command timed out`);
   return new Promise((resolve, reject) => {
     const child = spawnCli("docker", args, {
@@ -891,7 +895,13 @@ export async function listManagedVpsComputers(
   vpsAliases?: string[],
 ): Promise<ManagedVpsInventory> {
   const defaultAlias = vpsTransportAlias(snapshotVpsConfig(cfg));
-  const scanning = [...new Set((vpsAliases?.length ? vpsAliases : defaultAlias ? [defaultAlias] : []).filter(isValidSshAlias))];
+  // A socket transport reaches exactly one daemon: scanning several aliases would label that
+  // one daemon's containers under every remote alias, and a removal could then delete a local
+  // container in a remote alias's name. Socket mode scans only the configured target.
+  const requested = localDockerSocket()
+    ? defaultAlias ? [defaultAlias] : []
+    : vpsAliases?.length ? vpsAliases : defaultAlias ? [defaultAlias] : [];
+  const scanning = [...new Set(requested.filter(isValidSshAlias))];
   if (scanning.length === 0) {
     return { configured: false, available: false, vpsAliases: [], problem: null, instances: [] };
   }

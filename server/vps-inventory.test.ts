@@ -104,6 +104,22 @@ describe("managed VPS inventory", () => {
     expect(fake.calls).toEqual([]);
   });
 
+  it("scans only the configured target in socket mode, never mislabeling local containers under remote aliases", async () => {
+    const ownedName = vpsContainerName(OWNER.botId);
+    const fake = inventoryRunner([{ id: "a".repeat(64), name: ownedName }]);
+    process.env.OMB_VPS_DOCKER_HOST = "unix:///var/run/docker.sock";
+    try {
+      // Even with several remote aliases requested, the socket reaches one daemon only.
+      const inventory = await listManagedVpsComputers(CONFIG, [OWNER], fake.runner, ["alpha-vps", "beta-vps"]);
+      expect(inventory.vpsAliases).toEqual(["production-vps"]);
+      expect(inventory.instances.map((instance) => instance.vpsAlias)).toEqual(["production-vps"]);
+      // The fixture records args.slice(2); socket routing itself is pinned in vps-computer.test.ts.
+      expect(fake.calls.length).toBeGreaterThan(0);
+    } finally {
+      delete process.env.OMB_VPS_DOCKER_HOST;
+    }
+  });
+
   it("lists current and orphaned stopped computers without waking or leaking them", async () => {
     const ownedName = vpsContainerName(OWNER.botId);
     const orphanName = vpsContainerName("deleted-bot");

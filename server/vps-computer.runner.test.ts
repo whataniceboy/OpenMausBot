@@ -160,6 +160,26 @@ describe("default VPS command runner", () => {
     expect(settled).toBe(true);
   });
 
+  it("abandons a stuck warmup after half the budget, so Docker still gets its turn", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild();
+    spawnMock.mockImplementation(() => child);
+    // Simulate the real warmup's timeout: it rejects only once its own budget runs out.
+    masterMock.mockImplementation(async (_ssh, _dest, ms: number) => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      throw new Error("warmup timed out");
+    });
+    const result = defaultRunner(["-H", "ssh://production-vps", "info"], { timeoutMs: 100 });
+    void result.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(49);
+    expect(spawnMock).not.toHaveBeenCalled(); // still inside the warmup's half budget
+    await vi.advanceTimersByTimeAsync(2);
+    expect(spawnMock).toHaveBeenCalled(); // Docker spawned at the halfway mark, with time to spare
+    child.stdout.end("ok");
+    child.emit("close", 0, null);
+    await expect(result).resolves.toEqual({ stdout: "ok", stderr: "" });
+  });
+
   it.skipIf(process.platform === "win32").each(["timeout", "stdin"])("reaps real SSH-like grandchildren after %s without stopping an unrelated master", async (failure) => {
     const { spawn: realSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
     const { killCliTree: realStop } = await vi.importActual<typeof import("./procs.ts")>("./procs.ts");
