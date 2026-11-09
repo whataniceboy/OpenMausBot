@@ -14,7 +14,7 @@ vi.mock("./procs.ts", async () => ({
   killCliTree: stopMock,
 }));
 
-import { defaultRunner } from "./vps-computer.ts";
+import { defaultRunner, dockerCliInstallCommand } from "./vps-computer.ts";
 import { resolveCliSpawn } from "./env-path.ts";
 
 type FakeChild = EventEmitter & {
@@ -35,13 +35,19 @@ function fakeChild(): FakeChild {
 }
 
 describe("default VPS command runner", () => {
+  let savedDockerHost: string | undefined;
   beforeEach(() => {
     spawnMock.mockReset();
     stopMock.mockReset().mockResolvedValue(true);
+    // These tests assert SSH-transport behavior; an inherited socket setting would reroute them.
+    savedDockerHost = process.env.OMB_VPS_DOCKER_HOST;
+    delete process.env.OMB_VPS_DOCKER_HOST;
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    if (savedDockerHost !== undefined) process.env.OMB_VPS_DOCKER_HOST = savedDockerHost;
+    else delete process.env.OMB_VPS_DOCKER_HOST;
   });
 
   it("collects output and resolves after the child closes", async () => {
@@ -78,11 +84,11 @@ describe("default VPS command runner", () => {
     vi.useFakeTimers();
     const child = fakeChild();
     let finishCleanup!: () => void;
-    stopMock.mockReturnValue(new Promise<void>((resolve) => { finishCleanup = resolve; }));
+    stopMock.mockReturnValue(new Promise<boolean>((resolve) => { finishCleanup = () => resolve(true); }));
     let settled = false;
     const result = defaultRunner(["info"], { timeoutMs: 100 });
     void result.then(() => { settled = true; }, () => { settled = true; });
-    const rejection = expect(result).rejects.toThrow("Docker-over-SSH command timed out");
+    const rejection = expect(result).rejects.toThrow("Docker over SSH command timed out");
 
     await vi.advanceTimersByTimeAsync(100);
     expect(stopMock).toHaveBeenCalledWith(child, 5_000);
@@ -92,6 +98,32 @@ describe("default VPS command runner", () => {
     finishCleanup();
     await rejection;
     expect(child.stdout.destroyed && child.stderr.destroyed).toBe(true);
+  });
+
+  it("holds the rejection briefly when tree termination is unconfirmed, so a retry cannot overlap the survivor", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild();
+    stopMock.mockResolvedValue(false);
+    let settled = false;
+    const result = defaultRunner(["info"], { timeoutMs: 100 });
+    void result.then(() => { settled = true; }, () => { settled = true; });
+    const rejection = expect(result).rejects.toThrow("Docker over SSH command timed out");
+
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(4_900);
+    expect(settled).toBe(false); // killCliTree answered false — the hold keeps the caller waiting
+    await vi.advanceTimersByTimeAsync(200);
+    await rejection;
+    expect(child.stdout.destroyed && child.stderr.destroyed).toBe(true);
+  });
+
+  it("names the Docker CLI install line when the CLI is absent", async () => {
+    const child = fakeChild();
+    const result = defaultRunner(["info"]);
+    child.emit("error", Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" }));
+    const message = await result.catch((error: Error) => error.message);
+    expect(message).toContain("Docker over SSH could not start: spawn docker ENOENT");
+    expect(message).toContain(dockerCliInstallCommand(process.platform)!);
   });
 
   it.skipIf(process.platform === "win32").each(["timeout", "stdin"])("reaps real SSH-like grandchildren after %s without stopping an unrelated master", async (failure) => {

@@ -44,20 +44,20 @@ function inventoryRunner(initial: ContainerFixture[]) {
       return { stdout: containers.map((container) => container.id.slice(0, 12)).join("\n"), stderr: "" };
     }
     if (command[0] === "container" && command[1] === "inspect") {
-      const requested = command.slice(2);
+      // The scan projects one small JSON object per container (--format), so a full inventory
+      // never approaches the runner's output cap.
+      const requested = command.slice(2).filter((arg) => !arg.startsWith("--") && !arg.startsWith("{"));
       return {
-        stdout: JSON.stringify(containers
+        stdout: containers
           .filter((container) => requested.some((id) => container.id.startsWith(id)))
-          .map((container) => ({
+          .map((container) => JSON.stringify({
             Id: container.id,
             Name: `/${container.name}`,
-            Config: {
-              Env: ["VNC_PW=must-not-leak"],
-              Labels: container.labels ?? labels(container.name),
-            },
-            State: { Status: container.state ?? "running", Running: container.running ?? true },
-            NetworkSettings: { Networks: { bridge: { IPAddress: "172.17.0.9" } } },
-          }))),
+            Labels: container.labels ?? labels(container.name),
+            Status: container.state ?? "running",
+            Running: container.running ?? true,
+          }))
+          .join("\n") + "\n",
         stderr: "",
       };
     }
@@ -188,16 +188,18 @@ describe("managed VPS inventory", () => {
         return { stdout: containers.map((container) => container.id.slice(0, 12)).join("\n"), stderr: "" };
       }
       if (command[0] === "container" && command[1] === "inspect") {
-        const requested = command.slice(2);
+        const requested = command.slice(2).filter((arg) => !arg.startsWith("--") && !arg.startsWith("{"));
         return {
-          stdout: JSON.stringify(containers
+          stdout: containers
             .filter((container) => requested.some((id) => container.id.startsWith(id)))
-            .map((container) => ({
+            .map((container) => JSON.stringify({
               Id: container.id,
               Name: `/${container.name}`,
-              Config: { Labels: container.labels ?? labels(container.name) },
-              State: { Status: container.state ?? "running", Running: container.running ?? true },
-            }))),
+              Labels: container.labels ?? labels(container.name),
+              Status: container.state ?? "running",
+              Running: container.running ?? true,
+            }))
+            .join("\n") + "\n",
           stderr: "",
         };
       }
