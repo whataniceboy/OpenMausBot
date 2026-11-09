@@ -17,7 +17,7 @@ import {
   builtInBrowserEnabled,
   changedInstanceIds,
   engineLaunches,
-  loadConfig,
+  loadConfig, DATA_DIR,
   localVmMode,
   mergeOpenCodeProviderKeys,
   saveConfig,
@@ -29,6 +29,8 @@ import type { InstanceConfigMap, ModelSelection } from "../contracts.ts";
 import type { RequestAuth } from "../request-auth.ts";
 import { parseConfigPatchForPerson } from "../decider/config-errors.ts";
 import { TEAM_PERSONAL_HINTS } from "../../shared/cloud-hints.ts";
+import { chmodSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { DECIDER_KEY_ERROR, deciderIncludedHere, deciderPatchKey, deciderSavePatch, deciderBorrowedKey, type Decider } from "../decider/index.ts";
 import type { ProviderRegistry } from "../harness/registry.ts";
 import { HOSTED_PROVIDER_SETTINGS_ERROR } from "../hosted-models.ts";
@@ -135,6 +137,43 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
       const patch = parseConfigPatchForPerson(body);
       if (deps.cloudTeam && patch.browserEngine?.egress?.proxy !== undefined && !(auth.kind === "session" && auth.session.teamRole === "owner")) {
         return json(res, 403, { error: "Only the Team Cloud owner can configure the browser proxy." });
+        return json(res, 403, { error: "Only the Team Cloud owner can configure the browser proxy." });
+      }
+      // The section merge replaces the nested object wholesale, so the patch starts from what is stored:
+      // one card's save must not clear the other's field.
+      let openConnectorTokenWrite: { file: string; token: string | null } | null = null;
+      if (patch.connectors?.openconnector) {
+        // The admin token never persists in config.json: a non-empty value lands in a 0600 file beside
+        // the data dir and only its reference is stored; an empty value clears both. The write itself is
+        // deferred to the save, so a request that fails validation leaves the file untouched.
+        const { adminToken, adminTokenRef: _, ...rest } = patch.connectors.openconnector;
+        const incoming = Object.fromEntries(Object.entries(rest).filter(([, value]) => value !== undefined));
+        const openconnector: { url?: string; adminTokenRef?: string } = { ...cfg.connectors?.openconnector, ...incoming };
+        if (adminToken !== undefined) {
+          const file = join(DATA_DIR, "openconnector-admin-token");
+          if (adminToken.trim()) {
+            openConnectorTokenWrite = { file, token: adminToken.trim() };
+            openconnector.adminTokenRef = `file:${file}`;
+          } else {
+            openConnectorTokenWrite = { file, token: null };
+            openconnector.adminTokenRef = "";
+          }
+        }
+        patch.connectors.openconnector = openconnector;
+        // Whichever backend is filled in wins: saving an address or token selects OpenConnector; clearing
+        // both hands the layer back to Composio if its key exists, else the layer is simply unconfigured.
+        if (patch.connectors.provider === undefined) {
+          if ((openconnector.url ?? "").trim() || (adminToken ?? "").trim()) patch.connectors.provider = "openconnector";
+          else if (!(openconnector.adminTokenRef ?? "").trim() && !process.env.OMB_OPENCONNECTOR_ADMIN_TOKEN?.trim()) patch.connectors.provider = "composio";
+        }
+      }
+      // A Composio key saved through its card selects Composio the same way; clearing the key falls back to
+      // OpenConnector when that one is filled in.
+      if (patch.composio?.apiKey !== undefined && patch.connectors?.provider === undefined) {
+        patch.connectors = patch.connectors ?? {};
+        if (patch.composio.apiKey.trim()) patch.connectors.provider = "composio";
+        else if ((cfg.connectors?.openconnector?.url ?? "").trim()
+          && ((cfg.connectors?.openconnector?.adminTokenRef ?? "").trim() || process.env.OMB_OPENCONNECTOR_ADMIN_TOKEN?.trim())) patch.connectors.provider = "openconnector";
       }
       if (patch.profile && ownProfile) {
         // The address is the verified claim's; a profile names no other.
@@ -546,6 +585,14 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
       const localVmModeChanged = changingLocalVmMode ? localVmModeChanging() : null;
       const externalSecretStorage = url.searchParams.get("secretStorage") === "external";
       try {
+        if (openConnectorTokenWrite) {
+          if (openConnectorTokenWrite.token === null) {
+            try { rmSync(openConnectorTokenWrite.file); } catch { /* absent is fine */ }
+          } else {
+            writeFileSync(openConnectorTokenWrite.file, openConnectorTokenWrite.token, { mode: 0o600 });
+            chmodSync(openConnectorTokenWrite.file, 0o600); // writeFileSync's mode only applies when the file is new
+          }
+        }
         if (patch.live) patch.live = liveSavePatch(cfg.live, patch.live);
         // Before the provider commit, so a failed write never leaves a foreign voice id to speak.
         if (changingVoiceProvider) store.clearVoiceSelections();
