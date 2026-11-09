@@ -12,6 +12,8 @@ import { VoiceHearingSetting } from "../VoiceHearingSetting";
 import { BuiltInReplyWait, LmStudioServer, OtherOpenAiCompatServers } from "../OpenAiCompatServers";
 import { OllamaServer } from "../OllamaServer";
 import { KEY_CATALOG, KEY_SECTIONS, keyHidden, keyMatches, savedState, type KeyEntry, type KeyId, type KeySectionId } from "./key-catalog";
+import { KEY_CATALOG, KEY_SECTIONS, keyMatches, savedState, type KeyEntry, type KeyId, type KeySectionId } from "./key-catalog";
+import { OpenConnectorRow, openConnectorMatches } from "./OpenConnectorRow";
 import { finishKeyFocus, useKeyFocus, type KeyFocusRequest } from "./key-focus";
 import { AnthropicEveryClaudeBot, OpenAiCompatUrl, OpenCodeProviderKeys, VoiceServerUrl } from "./KeyPanels";
 import { VpsConnection } from "./VpsServersPanel";
@@ -86,8 +88,9 @@ export function KeyCatalogRow({ entry, visible }: { entry: KeyEntry; visible: bo
   return <KeyRow id={entry.id}>{EXTRAS[entry.id]?.()}</KeyRow>;
 }
 
-function KeySection({ id, rows, open, onToggle }: { id: KeySectionId; rows: KeyEntry[]; open: boolean; onToggle: () => void }) {
-  const state = useStoreSelector((s) => ({ config: s.config }), sameFields);
+function KeySection({ id, rows, open, onToggle, query }: { id: KeySectionId; rows: KeyEntry[]; open: boolean; onToggle: () => void; query: string }) {
+  const { state } = useStore();
+
   const section = KEY_SECTIONS.find((candidate) => candidate.id === id)!;
   const headId = useId();
   const bodyId = useId();
@@ -112,6 +115,7 @@ function KeySection({ id, rows, open, onToggle }: { id: KeySectionId; rows: KeyE
         {rows.map((entry) => <KeyCatalogRow key={entry.id} entry={entry} visible={open} />)}
         {id === "voice" && <VoiceEveryReplySetting />}
         {id === "voice" && <VoiceHearingSetting />}
+        {id === "apps" && openConnectorMatches(query) && <OpenConnectorRow />}
       </div>
     </section>
   );
@@ -225,6 +229,7 @@ export function KeysPage({ bare = false, exclude = [] }: { bare?: boolean; exclu
           id={id}
           rows={sectionRows}
           open={q !== "" || open.has(id)}
+          query={q}
           onToggle={() => setOpen((current) => {
             const next = new Set(current);
             if (next.has(id)) next.delete(id);
