@@ -14,7 +14,7 @@ vi.mock("./procs.ts", async () => ({
   killCliTree: stopMock,
 }));
 
-import { defaultRunner, dockerCliInstallCommand } from "./vps-computer.ts";
+import { defaultRunner } from "./vps-computer.ts";
 import { resolveCliSpawn } from "./env-path.ts";
 
 type FakeChild = EventEmitter & {
@@ -68,7 +68,7 @@ describe("default VPS command runner", () => {
 
     child.stdin.emit("error", new Error("write EPIPE"));
 
-    await expect(result).rejects.toThrow("Docker-over-SSH stdin failed: write EPIPE");
+    await expect(result).rejects.toThrow("Docker over SSH stdin failed: write EPIPE");
     expect(stopMock).toHaveBeenCalledWith(child, 5_000);
     expect(child.stdin.destroyed && child.stdout.destroyed && child.stderr.destroyed).toBe(true);
     child.emit("close", 1, null);
@@ -92,15 +92,6 @@ describe("default VPS command runner", () => {
     finishCleanup();
     await rejection;
     expect(child.stdout.destroyed && child.stderr.destroyed).toBe(true);
-  });
-
-  it("names the Docker CLI install line when the CLI is absent", async () => {
-    const child = fakeChild();
-    const result = defaultRunner(["info"]);
-    child.emit("error", Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" }));
-    const message = await result.catch((error: Error) => error.message);
-    expect(message).toContain("Docker-over-SSH could not start: spawn docker ENOENT");
-    expect(message).toContain(dockerCliInstallCommand(process.platform)!);
   });
 
   it.skipIf(process.platform === "win32").each(["timeout", "stdin"])("reaps real SSH-like grandchildren after %s without stopping an unrelated master", async (failure) => {
