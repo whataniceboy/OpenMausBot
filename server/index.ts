@@ -643,6 +643,7 @@ import { createCardRequester, linePersonKey } from "./host/thread-person.ts"; im
 import { createThreadRoutes } from "./routes/threads.ts";
 import { createWebhookRoutes } from "./routes/webhooks.ts"; import { createRemoteTeammateRoutes } from "./routes/remote-teammates.ts"; import { RemoteTeammates } from "./remote-teammates.ts"; import { createRemoteHandoff, isRemoteBotId } from "./host/remote-teammate-handoff.ts";
 import { withScopeHint } from "./connector-scope-hint.ts"; import { accountsByApp, withAccountHint } from "./connector-account-hint.ts";
+import { decodeConnectedAccountId } from "./connectors/common.ts";
 import { connectorFileDeps, connectorFileScope, prepareConnectorFiles, withMissingFileHint } from "./connector-files.ts";
 import { createConnectorCards } from "./host/connector-cards.ts";
 import { createLoginMailCodes } from "./host/login-mail-codes.ts"; import { startEngineSessionSweep } from "./host/engine-session-sweep.ts"; import { createLateToolResults } from "./host/late-tool-results.ts"; import { internalBodyRefusal } from "./host/internal-body-ids.ts";
@@ -14719,8 +14720,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const body = await readBody(req); const refused = managedPolicy.appRefusal(m[1]); if (refused) return json(res, 403, { error: refused, code: "managed_policy" });
       const started = await composio.authorizeService(cfg, m[1], body.alias); void routineHolds?.connections("added"); connectionHealth.added("app", m[1], auth.kind === "session" ? auth.session.email ?? null : null); return json(res, 200, started);
     }
-    m = path.match(/^\/api\/connectors\/([\w-]+)\/accounts\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/);
-    if (m && method === "DELETE") { const removed = await composio.removeAccount(cfg, m[1], m[2]); void routineHolds?.connections("removed"); return json(res, 200, removed); }
+    m = path.match(/^\/api\/connectors\/([\w-]+)\/accounts\/([^/]+)$/);
+    if (m && method === "DELETE") { const accountId = decodeConnectedAccountId(m[2]); if (accountId === undefined) return json(res, 400, { error: "invalid connected-account ID" }); const removed = await composio.removeAccount(cfg, m[1], accountId); void routineHolds?.connections("removed"); return json(res, 200, removed); }
     m = path.match(/^\/api\/connectors\/([\w-]+)$/);
     if (m && method === "DELETE") { const removed = await composio.removeService(cfg, m[1]); void routineHolds?.connections("removed"); connectionHealth.removed("app", m[1]); return json(res, 200, removed); }
 
