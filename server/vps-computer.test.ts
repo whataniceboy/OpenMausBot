@@ -307,6 +307,30 @@ describe("VPS computer", () => {
     expect(() => vpsContainerMcpArgs("production-vps", "not a container")).toThrow(/connection/);
   });
 
+  it("routes through a local socket when OMB_VPS_DOCKER_HOST is a unix URL", () => {
+    const saved = process.env.OMB_VPS_DOCKER_HOST;
+    process.env.OMB_VPS_DOCKER_HOST = "unix:///var/run/docker.sock";
+    try {
+      expect(vpsDockerArgs("production-vps", ["info"])).toEqual(["-H", "unix:///var/run/docker.sock", "info"]);
+    } finally {
+      if (saved !== undefined) process.env.OMB_VPS_DOCKER_HOST = saved;
+      else delete process.env.OMB_VPS_DOCKER_HOST;
+    }
+  });
+
+  it("provisions over the socket without any SSH alias configured", async () => {
+    const fake = fixture({ image: false, container: false });
+    process.env.OMB_VPS_DOCKER_HOST = "unix:///var/run/docker.sock";
+    try {
+      const status = await vpsComputerAction("provision", { vps: {} }, BOT_ID, fake.runner);
+      expect(status.ready).toBe(true);
+      expect(fake.calls.length).toBeGreaterThan(0);
+      expect(fake.calls.every(({ args }) => args[0] === "-H" && args[1] === "unix:///var/run/docker.sock")).toBe(true);
+    } finally {
+      delete process.env.OMB_VPS_DOCKER_HOST;
+    }
+  });
+
   it("keeps the live desktop behind a validated loopback SSH forward", () => {
     const args = vpsSshTunnelArgs("production-vps", 45678, "172.17.0.5");
     expect(args).toContain("127.0.0.1:45678:172.17.0.5:6901");
