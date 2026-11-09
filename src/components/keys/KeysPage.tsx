@@ -9,6 +9,7 @@ import { LiveProviderSettings } from "../LiveProviderSettings";
 import { VoiceEveryReplySetting } from "../VoiceEveryReplySetting";
 import { BuiltInReplyWait, LmStudioServer, OtherOpenAiCompatServers } from "../OpenAiCompatServers";
 import { KEY_CATALOG, KEY_SECTIONS, keyMatches, savedState, type KeyEntry, type KeyId, type KeySectionId } from "./key-catalog";
+import { OpenConnectorRow, openConnectorMatches } from "./OpenConnectorRow";
 import { finishKeyFocus, useKeyFocus, type KeyFocusRequest } from "./key-focus";
 import { AnthropicEveryClaudeBot, OpenAiCompatUrl, OpenCodeProviderKeys, VpsConnection } from "./KeyPanels";
 import { KEY_ROW, KeyRow, MaskedKey, RowHeading, type KeyStatus } from "./KeyRow";
@@ -79,7 +80,7 @@ export function KeyCatalogRow({ entry }: { entry: KeyEntry }) {
   return <KeyRow id={entry.id}>{EXTRAS[entry.id]?.()}</KeyRow>;
 }
 
-function KeySection({ id, rows, open, onToggle }: { id: KeySectionId; rows: KeyEntry[]; open: boolean; onToggle: () => void }) {
+function KeySection({ id, rows, open, onToggle, query }: { id: KeySectionId; rows: KeyEntry[]; open: boolean; onToggle: () => void; query: string }) {
   const { state } = useStore();
   const section = KEY_SECTIONS.find((candidate) => candidate.id === id)!;
   const headId = useId();
@@ -104,6 +105,7 @@ function KeySection({ id, rows, open, onToggle }: { id: KeySectionId; rows: KeyE
       <div id={bodyId} hidden={!open} className="flex flex-col gap-0.5 border-t border-hairline/40 px-1 py-1.5 in-data-[settings-look=simple]:border-t-[0.5px] in-data-[settings-look=simple]:border-(--settings-edge)">
         {rows.map((entry) => <KeyCatalogRow key={entry.id} entry={entry} />)}
         {id === "voice" && <VoiceEveryReplySetting />}
+        {id === "apps" && openConnectorMatches(query) && <OpenConnectorRow />}
       </div>
     </section>
   );
@@ -186,6 +188,7 @@ export function KeysPage() {
           id={id}
           rows={sectionRows}
           open={q !== "" || open.has(id)}
+          query={q}
           onToggle={() => setOpen((current) => {
             const next = new Set(current);
             if (next.has(id)) next.delete(id);
