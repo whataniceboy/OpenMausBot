@@ -1,0 +1,7 @@
+# VPS deployment image: the source-built server (deploy branch) plus host tools.
+# The old bundle patches are gone: the deploy branch carries PR #4937 (local
+# docker socket + ControlMaster fix) and the OpenConnector provider natively.
+FROM openmausbot-src:0.1.150
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends python3 docker.io openssh-client && rm -rf /var/lib/apt/lists/*
+USER maus
