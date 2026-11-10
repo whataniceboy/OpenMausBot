@@ -65,6 +65,23 @@ services:
     - ./Caddyfile:/etc/caddy/Caddyfile:ro
     - caddy_data:/data
     - caddy_config:/config
+  open-connector:
+    image: openmausbot-src:0.1.150
+    restart: unless-stopped
+    init: true
+    mem_limit: 512m
+    network_mode: service:omb
+    environment:
+      OOMOL_CONNECT_ADMIN_TOKEN: ${OMB_OPENCONNECTOR_ADMIN_TOKEN:-}
+    depends_on:
+      omb:
+        condition: service_healthy
+    volumes:
+    - data:/data
+    command:
+    - sh
+    - -c
+    - sleep 2 && /data/.openmausbot/open-connector/start.sh
 volumes:
   data: null
   caddy_data: null
