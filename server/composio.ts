@@ -8,6 +8,7 @@ import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { canonicalToolkitSlug, inputError } from "./composio-project.ts";
 import type { ConnectorToolGrant } from "../shared/wire.ts";
 import type { BrokerAccess } from "./composio-broker-access.ts";
+import { managedComposioBrokerOff } from "./composio-broker-access.ts";
 import { connectorProvider } from "./connectors/provider.ts";
 import { normalizeAccountAlias, toolkitCategories } from "./connectors/common.ts";
 import { CURATED, CURATED_SLUGS } from "./connectors/catalog.ts";
