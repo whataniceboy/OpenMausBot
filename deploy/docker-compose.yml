@@ -27,6 +27,8 @@ services:
     ports:
     - 80:80
     - 443:443
+    # The OpenConnector OAuth callback (tunneled from the Mac via ssh -L).
+    - 127.0.0.1:13001:3001
     environment:
       OMB_PORT: '8799'
       OMB_BROWSER_SANDBOX: '0'
