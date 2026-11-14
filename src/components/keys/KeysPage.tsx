@@ -11,7 +11,6 @@ import { VoiceEveryReplySetting } from "../VoiceEveryReplySetting";
 import { BuiltInReplyWait, LmStudioServer, OtherOpenAiCompatServers } from "../OpenAiCompatServers";
 import { OllamaServer } from "../OllamaServer";
 import { KEY_CATALOG, KEY_SECTIONS, keyHidden, keyMatches, savedState, type KeyEntry, type KeyId, type KeySectionId } from "./key-catalog";
-import { KEY_CATALOG, KEY_SECTIONS, keyMatches, savedState, type KeyEntry, type KeyId, type KeySectionId } from "./key-catalog";
 import { OpenConnectorRow, openConnectorMatches } from "./OpenConnectorRow";
 import { finishKeyFocus, useKeyFocus, type KeyFocusRequest } from "./key-focus";
 import { AnthropicEveryClaudeBot, OpenAiCompatUrl, OpenCodeProviderKeys, VpsConnection } from "./KeyPanels";

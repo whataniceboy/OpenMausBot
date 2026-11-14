@@ -131,15 +131,11 @@ describe("default VPS command runner", () => {
     expect(message).toContain(dockerCliInstallCommand(process.platform)!);
   });
 
-  it("still runs Docker when the SSH warmup is rejected (a restricted key may allow only dial-stdio)", async () => {
-    const child = fakeChild();
-    spawnMock.mockImplementation(() => child);
+  it("fails the command when the SSH warmup is rejected, so an unreachable host is reported untouched", async () => {
+    fakeChild();
     masterMock.mockRejectedValue(new Error("command not allowed"));
-    const result = defaultRunner(["-H", "ssh://production-vps", "info"]);
-    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled()); // let the warmup settle and spawn first
-    child.stdout.end("ok");
-    child.emit("close", 0, null);
-    await expect(result).resolves.toEqual({ stdout: "ok", stderr: "" });
+    await expect(defaultRunner(["-H", "ssh://production-vps", "info"])).rejects.toThrow("command not allowed");
+    expect(spawnMock).not.toHaveBeenCalled(); // Docker never touches an unreachable host's containers
   });
 
   it("subtracts SSH warmup time from the Docker command budget", async () => {
@@ -160,24 +156,19 @@ describe("default VPS command runner", () => {
     expect(settled).toBe(true);
   });
 
-  it("abandons a stuck warmup after half the budget, so Docker still gets its turn", async () => {
+  it("fails the command when the SSH warmup itself times out, without spawning Docker", async () => {
     vi.useFakeTimers();
-    const child = fakeChild();
-    spawnMock.mockImplementation(() => child);
+    fakeChild();
     // Simulate the real warmup's timeout: it rejects only once its own budget runs out.
     masterMock.mockImplementation(async (_ssh, _dest, ms: number) => {
       await new Promise((resolve) => setTimeout(resolve, ms));
-      throw new Error("warmup timed out");
+      throw new Error("VPS SSH initialization timed out");
     });
     const result = defaultRunner(["-H", "ssh://production-vps", "info"], { timeoutMs: 100 });
-    void result.catch(() => undefined);
-    await vi.advanceTimersByTimeAsync(49);
-    expect(spawnMock).not.toHaveBeenCalled(); // still inside the warmup's half budget
-    await vi.advanceTimersByTimeAsync(2);
-    expect(spawnMock).toHaveBeenCalled(); // Docker spawned at the halfway mark, with time to spare
-    child.stdout.end("ok");
-    child.emit("close", 0, null);
-    await expect(result).resolves.toEqual({ stdout: "ok", stderr: "" });
+    const rejection = expect(result).rejects.toThrow("VPS SSH initialization timed out");
+    await vi.advanceTimersByTimeAsync(30_000); // well past the warmup's small budget here
+    await rejection;
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   it.skipIf(process.platform === "win32").each(["timeout", "stdin"])("reaps real SSH-like grandchildren after %s without stopping an unrelated master", async (failure) => {

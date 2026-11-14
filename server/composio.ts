@@ -141,7 +141,7 @@ export async function relayMcp(
   cfg: AppConfig,
   payload: JsonValue,
   transportSessionId?: string,
-  beforeSend?: () => void, signal?: AbortSignal, as?: BrokerAccess,
+  beforeSend?: () => void | JsonValue | Promise<void | JsonValue>, signal?: AbortSignal, as?: BrokerAccess,
 ) {
   return provider().relayMcp(cfg, payload, transportSessionId, beforeSend, signal, as);
 }

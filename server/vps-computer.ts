@@ -126,8 +126,8 @@ export function vpsStartsForTurn(input: { wants: "cloud" | "vm" | "local" | "off
 }
 
 export function vpsUnavailableHint(input: { automationSource?: string; autoStartVps?: boolean; reachable?: boolean }): string {
-  if (input.automationSource) return "This scheduled run tried to start the VPS computer and could not reach it. Check the VPS connection in Settings → API keys.";
-  if (input.autoStartVps || input.reachable === false) return "Check the VPS connection in Settings → API keys.";
+  if (input.automationSource) return "This scheduled run tried to start the VPS computer and could not reach it. Check the VPS connection in Settings → AI → Other services.";
+  if (input.autoStartVps || input.reachable === false) return "Check the VPS connection in Settings → AI → Other services.";
   return input.reachable ? "Open Computer and enable Start VPS automatically, or choose Cloud computer to start it manually." : "";
 }
 
@@ -387,17 +387,13 @@ export async function defaultRunner(args: string[], options: VpsCommandOptions =
   // directory cannot break socket-based Docker commands.
   const socket = localDockerSocket();
   const ssh = socket ? { path: augmentedPath(), configPath: null } : prepareVpsSsh(DATA_DIR, augmentedPath());
-  const deadline = Date.now() + (options.timeoutMs ?? 120_000);
   // Like upstream's runner: bring up (or reuse) the shared master before Docker spawns, or a
-  // cold burst would make every command authenticate its own SSH connection. A rejected warmup
-  // must not stop Docker itself: a restricted key can permit `docker system dial-stdio` while
-  // rejecting the warmup probe, and the command may still succeed on its own connection.
+  // cold burst would make every command authenticate its own SSH connection. A rejected
+  // warmup fails the command before Docker spawns, so an unreachable host is reported
+  // without its containers being touched.
+  let deadline = Date.now() + (options.timeoutMs ?? 120_000);
   const destination = args[0] === "-H" && args[1]?.startsWith("ssh://") ? args[1]!.slice(6) : null;
-  // Reserve at least half the budget (and up to 30s) for Docker itself: a cold warmup that
-  // exhausts the whole command budget would fail before Docker ever gets to try, even when
-  // the daemon is reachable once the connection exists.
-  const warmupBudget = Math.min(30_000, Math.floor(Math.max(0, deadline - Date.now()) / 2));
-  if (destination && warmupBudget > 0) await Promise.resolve(ensureVpsSshMaster(ssh, destination, warmupBudget)).catch(() => undefined);
+  if (destination) deadline += (await ensureVpsSshMaster(ssh, destination, Math.min(30_000, deadline - Date.now()))) ?? 0;
   if (Date.now() >= deadline) throw new Error(`${dockerTransportLabel()} command timed out`);
   return new Promise((resolve, reject) => {
     const child = spawnCli("docker", args, {

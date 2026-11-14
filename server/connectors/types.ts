@@ -108,7 +108,7 @@ export interface ConnectorProvider {
     cfg: AppConfig,
     payload: JsonValue,
     transportSessionId?: string,
-    beforeSend?: () => void,
+    beforeSend?: () => void | JsonValue | Promise<void | JsonValue>,
     signal?: AbortSignal,
     as?: BrokerAccess,
   ): Promise<ConnectorRelayResult>;
