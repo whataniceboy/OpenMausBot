@@ -1144,6 +1144,7 @@ describe.sequential("Composio Sessions", () => {
       now.mockReturnValue(start + 61_000);
       sessionLookupFail = true;
       await expect(connectedServiceSlugs(cfg)).resolves.toContain("github");
+      await serviceSlugsReadSettled(); // the new read runs behind: let it reach the Session
       expect(sessionReads()).toBe(firstReads + 1);
     } finally {
       sessionLookupFail = false;

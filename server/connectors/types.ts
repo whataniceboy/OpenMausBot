@@ -31,6 +31,8 @@ export interface ConnectorToolListing {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
+  /** The tool's own listing says it only reads: annotations.readOnlyHint, and not destructiveHint. */
+  readOnly?: true;
 }
 
 /** The local MCP-proxy spawn a bot's engine runs to reach connector tools; the same bridge serves every provider. */
@@ -97,7 +99,9 @@ export interface ConnectorProvider {
   readonly id: "composio" | "openconnector";
   mode(cfg: AppConfig): ConnectorMode;
   isConfigured(cfg: AppConfig): boolean;
-  inventory(cfg: AppConfig, as?: BrokerAccess, options?: { fresh?: boolean }): Promise<ConnectedServicesInventory>;
+  inventory(cfg: AppConfig, as?: BrokerAccess): Promise<ConnectedServicesInventory>;
+  inventoryIdentity(cfg: AppConfig, as?: BrokerAccess): string;
+  serviceSlugsSettled(): Promise<void>;
   tools(cfg: AppConfig, force?: boolean): Promise<Record<string, ConnectorToolListing[]>>;
   serviceSlugs(cfg: AppConfig, as?: BrokerAccess, options?: { waitMs?: number }): Promise<readonly string[]>;
   status(cfg: AppConfig, slugs: string[], as?: BrokerAccess): Promise<Record<string, ConnectorServiceState>>;
@@ -110,7 +114,7 @@ export interface ConnectorProvider {
     cfg: AppConfig,
     payload: JsonValue,
     transportSessionId?: string,
-    beforeSend?: () => void,
+    beforeSend?: () => void | JsonValue | Promise<void | JsonValue>,
     signal?: AbortSignal,
     as?: BrokerAccess,
   ): Promise<ConnectorRelayResult>;

@@ -9,6 +9,8 @@ import { canonicalToolkitSlug, inputError } from "./composio-project.ts";
 import type { ConnectorToolGrant } from "../shared/wire.ts";
 import { managedComposioBrokerOff, type BrokerAccess } from "./composio-broker-access.ts";
 import { connectorProvider } from "./connectors/provider.ts";
+import { sharedInventory } from "./composio-inventory-cache.ts";
+export { CONNECTOR_SERVICE_SLUGS_STALE_MS } from "./connectors/composio.ts";
 import { normalizeAccountAlias } from "./connectors/common.ts";
 import { CURATED, CURATED_SLUGS } from "./connectors/catalog.ts";
 import {
@@ -140,7 +142,7 @@ export async function relayMcp(
   cfg: AppConfig,
   payload: JsonValue,
   transportSessionId?: string,
-  beforeSend?: () => void, signal?: AbortSignal, as?: BrokerAccess,
+  beforeSend?: () => void | JsonValue | Promise<void | JsonValue>, signal?: AbortSignal, as?: BrokerAccess,
 ) {
   return provider().relayMcp(cfg, payload, transportSessionId, beforeSend, signal, as);
 }
@@ -149,9 +151,15 @@ export async function connectedServicesInventory(cfg: AppConfig, as?: BrokerAcce
   return provider().inventory(cfg, as);
 }
 
-/** The inventory as the Apps page shows it: the provider keeps the coalesced read. */
+/** The inventory as the Apps page shows it: one read for readers together or within 20 s, read anew after a connection
+ * is started or removed here, or a status check differs from it. `fresh` always reads. */
 export function sharedConnectedInventory(cfg: AppConfig, options: { fresh?: boolean } = {}): Promise<ConnectedServicesInventory> {
-  return provider().inventory(cfg, undefined, options);
+  return sharedInventory(provider().inventoryIdentity(cfg), () => provider().inventory(cfg), options.fresh);
+}
+
+/** Resolves once no read of the service slugs is running. */
+export async function serviceSlugsReadSettled(): Promise<void> {
+  return provider().serviceSlugsSettled();
 }
 
 export async function verifiedConnectedServiceSlugs(cfg: AppConfig, as?: BrokerAccess): Promise<readonly string[]> {

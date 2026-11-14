@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { spawnMock, stopMock, masterMock } = vi.hoisted(() => ({ spawnMock: vi.fn(), stopMock: vi.fn(), masterMock: vi.fn() }));
+const { spawnMock, stopMock } = vi.hoisted(() => ({ spawnMock: vi.fn(), stopMock: vi.fn() }));
 
 vi.mock("node:child_process", async () => ({
   ...(await vi.importActual<typeof import("node:child_process")>("node:child_process")),
@@ -13,10 +13,6 @@ vi.mock("node:child_process", async () => ({
 vi.mock("./procs.ts", async () => ({
   ...(await vi.importActual<typeof import("./procs.ts")>("./procs.ts")),
   killCliTree: stopMock,
-}));
-vi.mock("./vps-ssh.ts", async () => ({
-  ...(await vi.importActual<typeof import("./vps-ssh.ts")>("./vps-ssh.ts")),
-  ensureVpsSshMaster: masterMock,
 }));
 
 import { defaultRunner, dockerCliInstallCommand, VpsHostUnreachableError } from "./vps-computer.ts";
@@ -44,16 +40,16 @@ describe("default VPS command runner", () => {
   beforeEach(() => {
     spawnMock.mockReset();
     stopMock.mockReset().mockResolvedValue(true);
-    masterMock.mockReset().mockResolvedValue(undefined);
-    // These tests assert SSH-transport behavior; an inherited socket setting would reroute them.
+    // These tests assert SSH-transport behavior; this fork's runner also routes a local
+    // socket when OMB_VPS_DOCKER_HOST is set, so an inherited value would reroute them.
     savedDockerHost = process.env.OMB_VPS_DOCKER_HOST;
     delete process.env.OMB_VPS_DOCKER_HOST;
   });
 
   afterEach(() => {
-    vi.useRealTimers();
     if (savedDockerHost !== undefined) process.env.OMB_VPS_DOCKER_HOST = savedDockerHost;
     else delete process.env.OMB_VPS_DOCKER_HOST;
+    vi.useRealTimers();
   });
 
   it("calls a host unreachable only when ssh itself says it never got there", async () => {
@@ -118,7 +114,7 @@ describe("default VPS command runner", () => {
 
     child.stdin.emit("error", new Error("write EPIPE"));
 
-    await expect(result).rejects.toThrow("Docker over SSH stdin failed: write EPIPE");
+    await expect(result).rejects.toThrow("Docker-over-SSH stdin failed: write EPIPE");
     expect(stopMock).toHaveBeenCalledWith(child, 5_000);
     expect(child.stdin.destroyed && child.stdout.destroyed && child.stderr.destroyed).toBe(true);
     child.emit("close", 1, null);
@@ -128,11 +124,11 @@ describe("default VPS command runner", () => {
     vi.useFakeTimers();
     const child = fakeChild();
     let finishCleanup!: () => void;
-    stopMock.mockReturnValue(new Promise<boolean>((resolve) => { finishCleanup = () => resolve(true); }));
+    stopMock.mockReturnValue(new Promise<void>((resolve) => { finishCleanup = resolve; }));
     let settled = false;
     const result = defaultRunner(["info"], { timeoutMs: 100 });
     void result.then(() => { settled = true; }, () => { settled = true; });
-    const rejection = expect(result).rejects.toThrow("Docker over SSH command timed out");
+    const rejection = expect(result).rejects.toThrow("Docker-over-SSH command timed out");
 
     await vi.advanceTimersByTimeAsync(100);
     expect(stopMock).toHaveBeenCalledWith(child, 5_000);
@@ -144,79 +140,13 @@ describe("default VPS command runner", () => {
     expect(child.stdout.destroyed && child.stderr.destroyed).toBe(true);
   });
 
-  it("holds the rejection briefly when tree termination is unconfirmed, so a retry cannot overlap the survivor", async () => {
-    vi.useFakeTimers();
-    const child = fakeChild();
-    stopMock.mockResolvedValue(false);
-    let settled = false;
-    const result = defaultRunner(["info"], { timeoutMs: 100 });
-    void result.then(() => { settled = true; }, () => { settled = true; });
-    const rejection = expect(result).rejects.toThrow("Docker over SSH command timed out");
-
-    await vi.advanceTimersByTimeAsync(100);
-    await vi.advanceTimersByTimeAsync(4_900);
-    expect(settled).toBe(false); // killCliTree answered false — the hold keeps the caller waiting
-    await vi.advanceTimersByTimeAsync(200);
-    await rejection;
-    expect(child.stdout.destroyed && child.stderr.destroyed).toBe(true);
-  });
-
   it("names the Docker CLI install line when the CLI is absent", async () => {
     const child = fakeChild();
     const result = defaultRunner(["info"]);
     child.emit("error", Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" }));
     const message = await result.catch((error: Error) => error.message);
-    expect(message).toContain("Docker over SSH could not start: spawn docker ENOENT");
+    expect(message).toContain("Docker-over-SSH could not start: spawn docker ENOENT");
     expect(message).toContain(dockerCliInstallCommand(process.platform)!);
-  });
-
-  it("still runs Docker when the SSH warmup is rejected (a restricted key may allow only dial-stdio)", async () => {
-    const child = fakeChild();
-    spawnMock.mockImplementation(() => child);
-    masterMock.mockRejectedValue(new Error("command not allowed"));
-    const result = defaultRunner(["-H", "ssh://production-vps", "info"]);
-    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalled()); // let the warmup settle and spawn first
-    child.stdout.end("ok");
-    child.emit("close", 0, null);
-    await expect(result).resolves.toEqual({ stdout: "ok", stderr: "" });
-  });
-
-  it("subtracts SSH warmup time from the Docker command budget", async () => {
-    vi.useFakeTimers();
-    const child = fakeChild();
-    spawnMock.mockImplementation(() => child);
-    stopMock.mockResolvedValue(true);
-    masterMock.mockImplementation(async () => { await new Promise((resolve) => setTimeout(resolve, 40)); });
-    let settled = false;
-    const result = defaultRunner(["-H", "ssh://production-vps", "info"], { timeoutMs: 100 });
-    void result.then(() => { settled = true; }, () => { settled = true; });
-    const rejection = expect(result).rejects.toThrow("Docker over SSH command timed out");
-
-    await vi.advanceTimersByTimeAsync(40); // warmup consumed 40ms of the budget
-    expect(settled).toBe(false);
-    await vi.advanceTimersByTimeAsync(60); // exactly the remaining budget: the timer must fire
-    await rejection;
-    expect(settled).toBe(true);
-  });
-
-  it("abandons a stuck warmup after half the budget, so Docker still gets its turn", async () => {
-    vi.useFakeTimers();
-    const child = fakeChild();
-    spawnMock.mockImplementation(() => child);
-    // Simulate the real warmup's timeout: it rejects only once its own budget runs out.
-    masterMock.mockImplementation(async (_ssh, _dest, ms: number) => {
-      await new Promise((resolve) => setTimeout(resolve, ms));
-      throw new Error("warmup timed out");
-    });
-    const result = defaultRunner(["-H", "ssh://production-vps", "info"], { timeoutMs: 100 });
-    void result.catch(() => undefined);
-    await vi.advanceTimersByTimeAsync(49);
-    expect(spawnMock).not.toHaveBeenCalled(); // still inside the warmup's half budget
-    await vi.advanceTimersByTimeAsync(2);
-    expect(spawnMock).toHaveBeenCalled(); // Docker spawned at the halfway mark, with time to spare
-    child.stdout.end("ok");
-    child.emit("close", 0, null);
-    await expect(result).resolves.toEqual({ stdout: "ok", stderr: "" });
   });
 
   it.skipIf(process.platform === "win32").each(["timeout", "stdin"])("reaps real SSH-like grandchildren after %s without stopping an unrelated master", async (failure) => {

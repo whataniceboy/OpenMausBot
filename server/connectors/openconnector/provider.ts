@@ -1,6 +1,7 @@
 // The OpenConnector backend: a local or self-hosted oomol-lab/open-connector runtime serving /v1
 // actions. OpenMausBot keeps only the runtime URL, a reference to the admin token, and this host's
 // connection aliases/labels (OpenConnectorStateStore); credentials stay on the runtime.
+import { createHash } from "node:crypto";
 import { DATA_DIR, type AppConfig } from "../../config.ts";
 import type { BrokerAccess } from "../../composio-broker-access.ts";
 import { canonicalToolkitSlug } from "../../composio-project.ts";
@@ -234,6 +235,8 @@ export function createOpenConnectorProvider(options: OpenConnectorProviderOption
     isConfigured: () => available(),
 
     inventory: (_cfg: AppConfig, as?: BrokerAccess) => inventory(as),
+    inventoryIdentity: (_cfg: AppConfig, as?: BrokerAccess) => `openconnector:${createHash("sha256").update(`${runtimeUrl}\0${as?.token ?? options.settings.adminTokenRef ?? ""}`).digest("hex")}`,
+    serviceSlugsSettled: () => Promise.resolve(),
 
     dispose: () => {
       disposed = true;

@@ -343,6 +343,10 @@ const appConfigSchema = z.object({
     .optional(),
   /** Composio project key; `userId`/`sessionId` reuse one Composio Session. */
   composio: z.object({ apiKey: secretText, userId: optionalText, sessionId: optionalText }).optional(),
+  connectors: z.object({
+    provider: z.enum(["composio", "openconnector"]).optional(),
+    openconnector: z.object({ url: optionalText, adminToken: secretText, adminTokenRef: optionalText }).optional(),
+  }).optional(),
   box: z.object({ token: secretText }).optional(),
   vps: vpsConfigSchema.optional(),
   vpsServers: vpsServersSchema.optional(),

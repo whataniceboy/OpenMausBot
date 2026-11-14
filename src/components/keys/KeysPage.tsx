@@ -12,7 +12,6 @@ import { VoiceHearingSetting } from "../VoiceHearingSetting";
 import { BuiltInReplyWait, LmStudioServer, OtherOpenAiCompatServers } from "../OpenAiCompatServers";
 import { OllamaServer } from "../OllamaServer";
 import { KEY_CATALOG, KEY_SECTIONS, keyHidden, keyMatches, savedState, type KeyEntry, type KeyId, type KeySectionId } from "./key-catalog";
-import { KEY_CATALOG, KEY_SECTIONS, keyMatches, savedState, type KeyEntry, type KeyId, type KeySectionId } from "./key-catalog";
 import { OpenConnectorRow, openConnectorMatches } from "./OpenConnectorRow";
 import { finishKeyFocus, useKeyFocus, type KeyFocusRequest } from "./key-focus";
 import { AnthropicEveryClaudeBot, OpenAiCompatUrl, OpenCodeProviderKeys, VoiceServerUrl } from "./KeyPanels";
@@ -89,7 +88,7 @@ export function KeyCatalogRow({ entry, visible }: { entry: KeyEntry; visible: bo
 }
 
 function KeySection({ id, rows, open, onToggle, query }: { id: KeySectionId; rows: KeyEntry[]; open: boolean; onToggle: () => void; query: string }) {
-  const { state } = useStore();
+  const state = useStoreSelector((s) => ({ config: s.config }), sameFields);
 
   const section = KEY_SECTIONS.find((candidate) => candidate.id === id)!;
   const headId = useId();

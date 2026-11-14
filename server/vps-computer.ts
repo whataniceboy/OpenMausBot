@@ -1,6 +1,7 @@
 // BYO Linux VPS: Docker's SSH transport reaches the user's daemon; one Cua MCP container per bot.
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { createConnection, createServer, type AddressInfo, type Socket, type Server as TcpServer } from "node:net";
 import type { ChildProcess } from "node:child_process";
 import { loopbackAnswers, unusedLoopbackPort } from "./vps-loopback.ts";
 import { OWN_GROUP, stopGroup } from "./group-exec.ts";
@@ -25,9 +26,10 @@ import { desktopCapArgs, dockerSecurityIsHardened, type DockerHardeningConfig } 
 import { applyResourcesBeforeStart, DEFAULT_DESKTOP_RESOURCES, PIDS_LIMIT, raisePidsLimit, resourceArgs, type DesktopResources } from "./container-limits.ts";
 import { DATA_DIR, isValidSshAlias, vpsResources, vpsSshAlias, type AppConfig } from "./config.ts";
 import { augmentedPath } from "./env-path.ts";
-import { COMMAND_TIMEOUT_KILL_GRACE_MS, defaultRunner, VpsHostUnreachableError, type VpsCommandRunner } from "./vps-command.ts";
-export { defaultRunner, VpsHostUnreachableError, type VpsCommandOptions, type VpsCommandRunner } from "./vps-command.ts";
+import { defaultRunner as vpsCommandRunner, VpsHostUnreachableError } from "./vps-command.ts";
+export { VpsHostUnreachableError } from "./vps-command.ts";
 import { prepareVpsSsh } from "./vps-ssh.ts";
+import { killCliTree, spawnCli } from "./procs.ts";
 import { loadEnvironmentId } from "./environment.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { dockerCliMissing, dockerCliMissingProblem } from "./vps-hints.ts";
@@ -94,8 +96,8 @@ const pendingScreenshots = new Map<string, Promise<VpsScreenshot>>();
 const viewerConnections = new Map<string, { privateIp: string; password: string }>();
 const REMOTE_VIEWER_GRACE_MS = 30_000;
 const NATIVE_VIEWER_LIFETIME_MS = 8 * 60 * 60_000;
-type DesktopTunnel = { onViewerClosed?: () => void; child: ReturnType<typeof spawn>; joinUrl: string; expiry: ReturnType<typeof setTimeout>; viewers: number; localViewer: boolean };
-type TunnelStart = { cancelled: boolean; child?: ReturnType<typeof spawn> };
+type DesktopTunnel = { onViewerClosed?: () => void; child: TunnelHandle; joinUrl: string; expiry: ReturnType<typeof setTimeout>; viewers: number; localViewer: boolean };
+type TunnelStart = { cancelled: boolean; child?: TunnelHandle };
 const desktopTunnels = new Map<string, DesktopTunnel>();
 const pendingDesktopTunnels = new Map<string, { promise: Promise<DesktopTunnel>; start: TunnelStart }>();
 
@@ -124,8 +126,8 @@ export function vpsStartsForTurn(input: { wants: "cloud" | "vm" | "local" | "off
 }
 
 export function vpsUnavailableHint(input: { automationSource?: string; autoStartVps?: boolean; reachable?: boolean }): string {
-  if (input.automationSource) return "This scheduled run tried to start the VPS computer and could not reach it. Check the VPS connection in Settings → API keys.";
-  if (input.autoStartVps || input.reachable === false) return "Check the VPS connection in Settings → API keys.";
+  if (input.automationSource) return "This scheduled run tried to start the VPS computer and could not reach it. Check the VPS connection in Settings → AI → Other services.";
+  if (input.autoStartVps || input.reachable === false) return "Check the VPS connection in Settings → AI → Other services.";
   return input.reachable ? "Open Computer and enable Start VPS automatically, or choose Cloud computer to start it manually." : "";
 }
 
@@ -260,19 +262,6 @@ export function vpsSshTunnelArgs(alias: string, localPort: number, privateIp: st
   ];
 }
 
-function stopDesktopTunnel(botId: string, expected?: DesktopTunnel): boolean {
-  if (!expected) {
-    const pending = pendingDesktopTunnels.get(botId);
-    if (pending) {
-      pending.start.cancelled = true;
-      const child = pending.start.child;
-      if (child) stopGroup(child);
-      pendingDesktopTunnels.delete(botId);
-    }
-  }
-  if (!child.killed) child.kill();
-}
-
 /** Stop a tunnel child: an ssh ChildProcess runs in its own group so the stop reaches its
  * ProxyCommand too; the socket-mode handle tears itself down with kill(). */
 function stopTunnelChild(child: TunnelHandle): void {
@@ -283,9 +272,18 @@ function stopTunnelChild(child: TunnelHandle): void {
   if (!child.killed) child.kill();
 }
 
-function teardownDesktopTunnel(botId: string): boolean {
-  const tunnel = desktopTunnels.get(botId);
-  if (!tunnel) return false;
+function stopDesktopTunnel(botId: string, expected?: DesktopTunnel): boolean {
+  if (!expected) {
+    const pending = pendingDesktopTunnels.get(botId);
+    if (pending) {
+      pending.start.cancelled = true;
+      const child = pending.start.child;
+      if (child) stopTunnelChild(child);
+      pendingDesktopTunnels.delete(botId);
+    }
+  }
+  const tunnel = expected ?? desktopTunnels.get(botId);
+  if (!tunnel || desktopTunnels.get(botId) !== tunnel) return false;
   desktopTunnels.delete(botId);
   clearTimeout(tunnel.expiry);
   stopTunnelChild(tunnel.child);
@@ -313,7 +311,7 @@ export function stopVpsDesktopTunnel(botId: string): boolean {
 }
 
 export function closeAllVpsDesktopTunnels(): void {
-  for (const botId of new Set([...desktopTunnels.keys(), ...pendingTunnelJoins.keys()])) stopDesktopTunnel(botId);
+  for (const botId of new Set([...desktopTunnels.keys(), ...pendingDesktopTunnels.keys()])) stopDesktopTunnel(botId);
 }
 
 export function vpsDesktopConnection(botId: string) {
@@ -367,21 +365,12 @@ function tailCollector() {
 
 export async function defaultRunner(args: string[], options: VpsCommandOptions = {}): Promise<{ stdout: string; stderr: string }> {
   // A local socket needs no SSH shim: skip prepareVpsSsh so an inaccessible SSH
-  // directory cannot break socket-based Docker commands.
+  // directory cannot break socket-based Docker commands. Everything else runs the
+  // upstream runner, so its SSH-vs-refusal failure semantics stay intact.
   const socket = localDockerSocket();
-  const ssh = socket ? { path: augmentedPath(), configPath: null } : prepareVpsSsh(DATA_DIR, augmentedPath());
+  if (!socket) return vpsCommandRunner(args, options);
+  const ssh = { path: augmentedPath(), configPath: null };
   const deadline = Date.now() + (options.timeoutMs ?? 120_000);
-  // Like upstream's runner: bring up (or reuse) the shared master before Docker spawns, or a
-  // cold burst would make every command authenticate its own SSH connection. A rejected warmup
-  // must not stop Docker itself: a restricted key can permit `docker system dial-stdio` while
-  // rejecting the warmup probe, and the command may still succeed on its own connection.
-  const destination = args[0] === "-H" && args[1]?.startsWith("ssh://") ? args[1]!.slice(6) : null;
-  // Reserve at least half the budget (and up to 30s) for Docker itself: a cold warmup that
-  // exhausts the whole command budget would fail before Docker ever gets to try, even when
-  // the daemon is reachable once the connection exists.
-  const warmupBudget = Math.min(30_000, Math.floor(Math.max(0, deadline - Date.now()) / 2));
-  if (destination && warmupBudget > 0) await Promise.resolve(ensureVpsSshMaster(ssh, destination, warmupBudget)).catch(() => undefined);
-  if (Date.now() >= deadline) throw new Error(`${dockerTransportLabel()} command timed out`);
   return new Promise((resolve, reject) => {
     const child = spawnCli("docker", args, {
       shell: false,
@@ -1320,29 +1309,6 @@ function socketViewerTunnel(localPort: number, containerIp: string): Promise<{ h
   });
 }
 
-/** A tunnel can outlive its container: before reusing one, confirm the name still resolves to the
- * same, running container it was built for. A transport hiccup keeps the live tunnel (it either
- * works or it does not); a confirmed replacement, a stopped container, or a missing container
- * forces a rebuild. */
-async function tunnelUnfitForReuse(
-  alias: string,
-  tunnel: { containerName: string; containerId: string | null },
-  runner: VpsCommandRunner,
-): Promise<boolean> {
-  if (!tunnel.containerId || !CONTAINER_NAME.test(tunnel.containerName)) return false;
-  try {
-    const inspected = await runner(
-      vpsDockerArgs(alias, ["inspect", tunnel.containerName, "--format", "{{.Id}} {{.State.Status}} {{.State.Running}}"]),
-      { timeoutMs: 10_000 },
-    );
-    const [id, status, running] = inspected.stdout.trim().toLowerCase().split(/\s+/);
-    // An external stop keeps the id but kills the desktop the tunnel forwards to; a paused
-    // container still reports Running=true while its desktop cannot answer.
-    return !id?.startsWith(tunnel.containerId.toLowerCase()) || status !== "running" || running !== "true";
-  } catch (error) {
-    return isMissingObjectMessage(error instanceof Error ? error.message : String(error));
-  }
-}
 
 export async function vpsComputerJoin(
   cfg: AppConfig,
@@ -1397,6 +1363,26 @@ async function startDesktopTunnel(cfg: AppConfig, botId: string, alias: string, 
     );
   }
 
+  // Socket mode: direct TCP proxy to the container's noVNC port, no SSH needed.
+  if (localDockerSocket()) {
+    let opened: { handle: TunnelHandle; port: number };
+    try {
+      opened = await socketViewerTunnel(0, connection.privateIp);
+    } catch (error) {
+      assertOpen();
+      throw Object.assign(new Error(`Could not open the VPS live desktop: ${error instanceof Error ? error.message : String(error)}`), { status: 502 });
+    }
+    assertOpen();
+    const joinUrl = `http://127.0.0.1:${opened.port}/vnc.html#autoconnect=true&resize=scale&password=${encodeURIComponent(connection.password)}`;
+    const tunnel: DesktopTunnel = {
+      child: opened.handle, joinUrl, viewers: 0, localViewer: false,
+      expiry: setTimeout(() => endViewerTunnel(botId, tunnel), REMOTE_VIEWER_GRACE_MS),
+    };
+    tunnel.expiry.unref();
+    desktopTunnels.set(botId, tunnel);
+    return tunnel;
+  }
+
   const localPort = await unusedLoopbackPort();
   assertOpen();
   const ssh = prepareVpsSsh(DATA_DIR, augmentedPath());
@@ -1413,45 +1399,31 @@ async function startDesktopTunnel(cfg: AppConfig, botId: string, alias: string, 
   child.stderr?.on("data", (chunk: string) => {
     stderr = `${stderr}${chunk}`.slice(-1000);
   });
-  child.once("error", (error) => {
+  child.once("error", (error: Error) => {
     failure = error.message;
   });
-  child.once("close", (code) => {
+  child.once("close", (code: number | null) => {
     const active = desktopTunnels.get(botId);
     if (active?.child === child) {
       clearTimeout(active.expiry);
       desktopTunnels.delete(botId);
       active.onViewerClosed?.();
     }
-    const connection = viewerConnections.get(`${alias}:${status.container_name}`);
-    if (!connection) {
-      throw Object.assign(
-        new Error("This VPS computer predates secure live desktop access — replace its managed container once"),
-        { status: 409 },
-      );
-    }
-    const joinUrlFor = (localPort: number) => `http://127.0.0.1:${localPort}/vnc.html#autoconnect=true&resize=scale&password=${encodeURIComponent(connection.password)}`;
-    const publish = (child: TunnelHandle, joinUrl: string) => {
-      if (pending.cancelled) {
-        stopTunnelChild(child);
-        throw closedWhileStarting();
-      }
-      const expiry = setTimeout(() => stopDesktopTunnel(botId), remoteViewer ? REMOTE_VIEWER_GRACE_MS : NATIVE_VIEWER_LIFETIME_MS);
-      expiry.unref?.();
-      desktopTunnels.set(botId, { child, joinUrl, expiry, viewers: 0, localViewer: !remoteViewer, containerName: status.container_name, containerId: status.container_id });
-      return { joinUrl, state: "running" as const };
-    };
+    if (!failure) failure = stderr.trim() || `SSH viewer tunnel exited ${code ?? "without a status"}`;
+  });
 
-    // Socket mode: direct TCP proxy to the container's noVNC port, no SSH needed.
-    if (localDockerSocket()) {
-      let opened: { handle: TunnelHandle; port: number };
-      try {
-        opened = await socketViewerTunnel(0, connection.privateIp);
-      } catch (error) {
-        throw Object.assign(new Error(`Could not open the VPS live desktop: ${error instanceof Error ? error.message : String(error)}`), { status: 502 });
-      }
-      return publish(opened.handle, joinUrlFor(opened.port));
-    }
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline && !failure) {
+    if (await loopbackAnswers(localPort)) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const ready = !failure && await loopbackAnswers(localPort);
+  if (start.cancelled || failure || !ready) {
+    stopGroup(child);
+    assertOpen();
+    const detail = failure || stderr.trim() || "the SSH port forward did not become ready";
+    throw Object.assign(new Error(`Could not open the VPS live desktop: ${detail}`), { status: 502 });
+  }
 
   const joinUrl = `http://127.0.0.1:${localPort}/vnc.html#autoconnect=true&resize=scale&password=${encodeURIComponent(connection.password)}`;
   const tunnel: DesktopTunnel = {

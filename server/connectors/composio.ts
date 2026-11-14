@@ -19,9 +19,9 @@ import {
   refusedAuthConfigReason,
   responseError,
 } from "../composio-project.ts";
-import { MULTI_ACCOUNT_CONFIG, authConfigRefusal, ensureProjectSession, projectApiKey, sessionForToolkit } from "../composio-session.ts";
+import { MULTI_ACCOUNT_CONFIG, authConfigRefusal, ensureProjectSession, projectApiKey, raiseAccountCap, sessionForToolkit } from "../composio-session.ts";
 import { inventoryAccountSchema, toolkitInventoryPageSchema } from "../composio-inventory-schema.ts";
-import { forgetInventory, sharedInventory } from "../composio-inventory-cache.ts";
+import { forgetInventory, inventoryDiffers } from "../composio-inventory-cache.ts";
 import { catalogFor } from "../composio-catalog.ts";
 import { authConfigUseLine, noManagedAuthToolkit, withNoManagedAuthNote } from "../connector-auth-config-hint.ts";
 import { planAccountLink } from "../../shared/connector-account-link.ts";
@@ -146,7 +146,7 @@ export async function relayMcp(
   cfg: AppConfig,
   payload: JsonValue,
   transportSessionId?: string,
-  beforeSend?: () => void, signal?: AbortSignal, as?: BrokerAccess,
+  beforeSend?: () => void | JsonValue | Promise<void | JsonValue>, signal?: AbortSignal, as?: BrokerAccess,
 ): Promise<{ status: number; bytes: Uint8Array; contentType: string; transportSessionId?: string }> {
   const apiKey = as ? null : projectApiKey(cfg);
   let url: string;
@@ -178,7 +178,7 @@ export async function relayMcp(
     headers.set("mcp-session-id", forwardedTransportSessionId);
   }
   // Discovery may await I/O: check turn authority and permissions after it, right before dispatch.
-  beforeSend?.();
+  const sent = await beforeSend?.(); if (sent !== undefined) payload = sent; // beforeSend may answer the frame to send instead (files it uploaded)
   const response = await withToolsListFallback(identity, payload, () => fetch(url, {
     method: "POST",
     headers,
@@ -311,14 +311,7 @@ function allServiceStates(
   return Object.fromEntries(services);
 }
 
-async function connectedServicesInventory(cfg: AppConfig, as?: BrokerAccess, options?: { fresh?: boolean }): Promise<ConnectedServicesInventory> {
-  const plain = async (): Promise<ConnectedServicesInventory> => await connectedServicesInventoryUncached(cfg, as);
-  if (options?.fresh) return plain();
-  const identity = connectorServiceCacheIdentity(cfg, as);
-  return sharedInventory(identity, plain, false);
-}
-
-async function connectedServicesInventoryUncached(cfg: AppConfig, as?: BrokerAccess): Promise<ConnectedServicesInventory> {
+async function connectedServicesInventory(cfg: AppConfig, as?: BrokerAccess): Promise<ConnectedServicesInventory> {
   const apiKey = as ? null : projectApiKey(cfg);
   if (!apiKey) {
     const response = await brokerRequest("/v1/connectors/connected", undefined, as);
@@ -412,87 +405,73 @@ async function listConnectorTools(
   }
 }
 
-const CONNECTOR_SERVICE_SLUGS_CACHE_MS = 60_000;
-let connectorServiceSlugsCache: {
-  at: number;
-  identity: string;
-  baseIdentity: string;
-  sessionId?: string;
-  slugs: readonly string[];
-} | null = null;
-const connectorServiceSlugsRequests = new Map<string, Promise<readonly string[]>>();
 
 function connectorServiceCacheIdentity(cfg: AppConfig, as?: BrokerAccess): string {
   const apiKey = as ? null : projectApiKey(cfg);
-  if (apiKey) return backendFingerprint("project-slugs", apiBase(), apiKey);
+  if (apiKey) return backendFingerprint("project-slugs", apiBase(), `${apiKey}\0${cfg.composio?.sessionId ?? ""}`);
   const broker = as ?? brokerAccess();
   return broker ? backendFingerprint("managed-slugs", broker.url, broker.token) : "none";
 }
 
-/** Real backend slugs, so an underscored service (bland_ai) is never captured by a plain-prefix grant
- * (bland); a failed read answers the last good one. A valid cache hit never wakes the Session. */
+/** Real backend slugs, so an underscored service (bland_ai) is never captured by a plain-prefix grant (bland); a failed read
+ * answers the last good one. An answer under a minute old is used as it is. An older one is used while it is read again
+ * behind, until it is CONNECTOR_SERVICE_SLUGS_STALE_MS old or a connection was started or removed here: from then the read
+ * is waited for, for at most `waitMs` when a caller gives one.
+ *
+ * Security: this list only decides which service a tool's name belongs to. It never makes a connection usable: the vendor
+ * refuses a removed one, and a call that names no tool is checked against verifiedConnectedServiceSlugs, which is never
+ * cached. The risk in an old list is a service connected elsewhere since (bland_ai) being read as another's (bland), so the
+ * list a call is judged by is never more than CONNECTOR_SERVICE_SLUGS_STALE_MS old. */
 async function connectedServiceSlugs(cfg: AppConfig, as?: BrokerAccess, options: { waitMs?: number } = {}): Promise<readonly string[]> {
-  const apiKey = as ? null : projectApiKey(cfg);
-  const baseIdentity = connectorServiceCacheIdentity(cfg, as);
-  const cache = connectorServiceSlugsCache;
-  const cacheSessionMatches = !apiKey || cfg.composio?.sessionId === cache?.sessionId;
-  if (cache && cache.baseIdentity === baseIdentity && cacheSessionMatches
-    && Date.now() - cache.at < CONNECTOR_SERVICE_SLUGS_CACHE_MS) {
-    return cache.slugs;
-  }
-  if (!apiKey) {
-    const existing = connectorServiceSlugsRequests.get(baseIdentity);
-    if (existing) return existing;
-  }
-  let request: Promise<readonly string[]> | undefined;
-  const walk = (async (): Promise<readonly string[]> => {
-    if (!apiKey) await Promise.resolve();
-    let identity = baseIdentity;
-    let sessionId = apiKey ? cfg.composio?.sessionId : undefined;
-    try {
-      if (apiKey) {
-        const session = await ensureProjectSession(cfg);
-        sessionId = session.session_id;
-        identity = backendFingerprint("project-tools", apiBase(), `${apiKey}\0${sessionId}`);
-      }
-      const existing = connectorServiceSlugsRequests.get(identity);
-      if (existing) return existing;
-      connectorServiceSlugsRequests.set(identity, request!);
-      const services = await connectedServices(cfg, as);
-      const slugs = Object.keys(services);
-      connectorServiceSlugsCache = { at: Date.now(), identity, baseIdentity, ...(sessionId ? { sessionId } : {}), slugs };
-      return slugs;
-    } catch {
-      const stale = connectorServiceSlugsCache;
-      const sameSession = !apiKey || sessionId === stale?.sessionId;
-      if (stale && (stale.identity === identity || stale.baseIdentity === baseIdentity) && sameSession) return stale.slugs;
-      return [] as readonly string[];
-    } finally {
-      const active = connectorServiceSlugsRequests.get(identity);
-      if (active === request) connectorServiceSlugsRequests.delete(identity);
-    }
-  })();
-  request = walk;
-  if (options.waitMs === undefined) {
-    try {
-      return await walk;
-    } finally {
-      for (const [identity, active] of connectorServiceSlugsRequests) {
-        if (active === request) connectorServiceSlugsRequests.delete(identity);
-      }
-    }
-  }
+  const identity = connectorServiceCacheIdentity(cfg, as);
+  const known = connectorServiceSlugsCache?.identity === identity ? connectorServiceSlugsCache : null;
+  const age = known ? Date.now() - known.at : Infinity;
+  if (known && age < CONNECTOR_SERVICE_SLUGS_CACHE_MS) return known.slugs;
+  const read = connectorServiceSlugsRequest?.identity === identity ? connectorServiceSlugsRequest.slugs : readServiceSlugs(cfg, as, identity);
+  if (known && age < CONNECTOR_SERVICE_SLUGS_STALE_MS) return known.slugs;
+  if (options.waitMs === undefined) return read;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const stale = connectorServiceSlugsCache?.slugs ?? ([] as readonly string[]);
-  const lastKnown = new Promise<readonly string[]>((resolve) => { timer = setTimeout(() => resolve(stale), options.waitMs); });
-  try {
-    return await Promise.race([walk, lastKnown]);
-  } finally {
-    clearTimeout(timer);
-    for (const [identity, active] of connectorServiceSlugsRequests) {
-      if (active === request) connectorServiceSlugsRequests.delete(identity);
-    }
-  }
+  const lastKnown = new Promise<readonly string[]>((resolve) => { timer = setTimeout(() => resolve(known?.slugs ?? [] as readonly string[]), options.waitMs); });
+  return Promise.race([read, lastKnown]).finally(() => clearTimeout(timer));
+}
+
+function readServiceSlugs(cfg: AppConfig, as: BrokerAccess | undefined, identity: string): Promise<readonly string[]> {
+  const read = connectedServices(cfg, as).then(
+    (services) => {
+      const slugs = Object.keys(services);
+      // A read that a connection change overtook answers its own caller and is not kept.
+      if (connectorServiceSlugsRequest?.slugs === read) connectorServiceSlugsCache = { at: Date.now(), identity, slugs };
+      return slugs;
+    },
+    () => connectorServiceSlugsCache?.identity === identity ? connectorServiceSlugsCache.slugs : [] as readonly string[],
+  ).finally(() => {
+    if (connectorServiceSlugsRequest?.slugs === read) connectorServiceSlugsRequest = null;
+  });
+  connectorServiceSlugsRequest = { identity, slugs: read };
+  serviceSlugReads.add(read);
+  void read.finally(() => serviceSlugReads.delete(read));
+  return read;
+}
+
+/** Resolves once no read of the service slugs is running. */
+async function serviceSlugsSettled(): Promise<void> {
+  while (serviceSlugReads.size) await Promise.all(serviceSlugReads);
+}
+
+const CONNECTOR_SERVICE_SLUGS_CACHE_MS = 60_000;
+export const CONNECTOR_SERVICE_SLUGS_STALE_MS = 5 * 60_000;
+let connectorServiceSlugsCache: { at: number; identity: string; slugs: readonly string[] } | null = null;
+let connectorServiceSlugsRequest: { identity: string; slugs: Promise<readonly string[]> } | null = null;
+const serviceSlugReads = new Set<Promise<readonly string[]>>();
+
+/**
+ * A connection started or removed here: the kept inventory and the slug list read as of it are stale.
+ * The identity a session-scoped key keeps its own entry, so one session's change never ages another's. */
+function connectionsChanged(cfg: AppConfig, as?: BrokerAccess): void {
+  const identity = connectorServiceCacheIdentity(cfg, as);
+  forgetInventory(identity);
+  if (connectorServiceSlugsCache?.identity === identity) connectorServiceSlugsCache = { ...connectorServiceSlugsCache, at: -Infinity };
+  if (connectorServiceSlugsRequest?.identity === identity) connectorServiceSlugsRequest = null;
 }
 
 const TOOL_DESCRIPTION_MAX = 240;
@@ -508,7 +487,10 @@ function connectorToolListing(tool: unknown): ConnectorToolListing | null {
   const trimmed = typeof description === "string"
     ? description.replace(/\s+/g, " ").trim().slice(0, TOOL_DESCRIPTION_MAX)
     : "";
-  return trimmed ? { name, description: trimmed } : { name };
+  const annotations = (tool as { annotations?: unknown }).annotations;
+  const hints = annotations && typeof annotations === "object" && !Array.isArray(annotations) ? annotations as { readOnlyHint?: unknown; destructiveHint?: unknown } : {};
+  const readOnly = hints.readOnlyHint === true && hints.destructiveHint !== true ? { readOnly: true as const } : {};
+  return { name, ...(trimmed ? { description: trimmed } : {}), ...readOnly };
 }
 
 async function collectConnectorTools(cfg: AppConfig): Promise<Record<string, ConnectorToolListing[]>> {
@@ -589,6 +571,12 @@ async function responseErrorFromBytes(status: number, bytes: Uint8Array): Promis
 }
 
 async function connectionStatus(cfg: AppConfig, slugs: string[]): Promise<Record<string, ConnectorServiceState>> {
+  const status = await readConnectionStatus(cfg, slugs);
+  if (inventoryDiffers(connectorServiceCacheIdentity(cfg), status, canonicalToolkitSlug)) connectionsChanged(cfg);
+  return status;
+}
+
+async function readConnectionStatus(cfg: AppConfig, slugs: string[]): Promise<Record<string, ConnectorServiceState>> {
   const canonicalSlugs = [...new Set(slugs.map(canonicalToolkitSlug))];
   const apiKey = projectApiKey(cfg);
   if (!apiKey) {
@@ -662,13 +650,6 @@ async function connectionStatus(cfg: AppConfig, slugs: string[]): Promise<Record
 }
 
 
-/** A connection started or removed here: the kept inventory and the slug list read as of it are stale. */
-function connectionsChangedHere(cfg: AppConfig, as?: BrokerAccess): void {
-  forgetInventory(connectorServiceCacheIdentity(cfg, as));
-  const cache = connectorServiceSlugsCache;
-  if (cache) connectorServiceSlugsCache = { ...cache, at: -Infinity };
-}
-
 async function removeService(cfg: AppConfig, slug: string, as?: BrokerAccess) {
   const toolkit = canonicalToolkitSlug(slug);
   const apiKey = as ? null : projectApiKey(cfg);
@@ -676,7 +657,7 @@ async function removeService(cfg: AppConfig, slug: string, as?: BrokerAccess) {
     const response = await brokerRequest(`/v1/connectors/${encodeURIComponent(toolkit)}`, { method: "DELETE" }, as);
     if (!response.ok) await throwBrokerError(response, `Connected apps: HTTP ${response.status}`);
     const removed = removalResponseSchema.parse(await response.json());
-    connectionsChangedHere(cfg, as);
+    connectionsChanged(cfg, as);
     return removed;
   }
   const session = await ensureProjectSession(cfg);
@@ -690,7 +671,7 @@ async function removeService(cfg: AppConfig, slug: string, as?: BrokerAccess) {
   const id = body.items?.find((item) => item.slug && canonicalToolkitSlug(item.slug) === toolkit)?.connected_account?.id;
   if (!id) return { removed: 0 };
   await deleteConnectedAccount(apiKey, id);
-  connectionsChangedHere(cfg, as);
+  connectionsChanged(cfg, as);
   return { removed: 1 };
 }
 
@@ -714,7 +695,7 @@ async function removeAccount(cfg: AppConfig, slug: string, accountId: string) {
     );
     if (!response.ok) await throwBrokerError(response, `Connected apps: HTTP ${response.status}`);
     const removed = removalResponseSchema.parse(await response.json());
-    connectionsChangedHere(cfg);
+    connectionsChanged(cfg);
     return removed;
   }
   const session = await ensureProjectSession(cfg);
@@ -728,7 +709,7 @@ async function removeAccount(cfg: AppConfig, slug: string, accountId: string) {
   );
   if (!owned) return { removed: 0 };
   await deleteConnectedAccount(apiKey, accountId);
-  connectionsChangedHere(cfg);
+  connectionsChanged(cfg);
   return { removed: 1 };
 }
 
@@ -770,7 +751,7 @@ async function authorizeService(cfg: AppConfig, slug: string, requestedAlias?: s
     }
     if (!response.ok) await throwBrokerError(response, `Connected apps: HTTP ${response.status}`);
     const body = authUrlResponseSchema.parse(await response.json());
-    connectionsChangedHere(cfg, as);
+    connectionsChanged(cfg, as);
     return { url: trustedAuthUrl(body.url, toolkit) };
   }
   const { session } = await sessionForToolkit(cfg, toolkit);
@@ -783,8 +764,8 @@ async function authorizeService(cfg: AppConfig, slug: string, requestedAlias?: s
   const plan = planAccountLink(toolkit, serviceAccounts, alias, MULTI_ACCOUNT_CONFIG.max_accounts_per_toolkit, () => `omb-retry-${randomUUID()}`);
   if (!plan.ok) throw inputError(plan.error, plan.status);
   for (const id of plan.replace) await deleteConnectedAccount(apiKey, id);
-  const linkRequest: AccountLinkRequest = { toolkit };
-  if (plan.alias) linkRequest.alias = plan.alias;
+  await raiseAccountCap(apiKey, session);
+  const linkRequest: AccountLinkRequest = plan.alias ? { toolkit, alias: plan.alias } : { toolkit };
   const link = (sessionId: string) =>
     fetch(`${apiBase()}/tool_router/session/${encodeURIComponent(sessionId)}/link`, {
       method: "POST",
@@ -809,7 +790,7 @@ async function authorizeService(cfg: AppConfig, slug: string, requestedAlias?: s
     }
   }
   const body = linkResponseSchema.parse(await res.json());
-  connectionsChangedHere(cfg);
+  connectionsChanged(cfg);
   return { url: trustedAuthUrl(body.redirect_url, toolkit) };
 }
 
@@ -840,6 +821,8 @@ export const composioProvider: ConnectorProvider = {
   mode: connectionModeFor,
   isConfigured: configuredFor,
   inventory: connectedServicesInventory,
+  inventoryIdentity: connectorServiceCacheIdentity,
+  serviceSlugsSettled,
   tools: (cfg, force) => listConnectorTools(cfg, { force }),
   serviceSlugs: connectedServiceSlugs,
   status: connectionStatus,
